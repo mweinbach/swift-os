@@ -1,4 +1,5 @@
 import AppKit
+import Metal
 import MetalKit
 import QuartzCore
 
@@ -55,7 +56,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.center()
         window.acceptsMouseMovedEvents = true
 
-        guard let device = MTLCreateSystemDefault() else {
+        guard let device = MTLCreateSystemDefaultDevice() else {
             fatalError("SwiftOS requires a Metal-capable GPU.")
         }
         let view = OSView(frame: window.contentLayoutRect, device: device)
