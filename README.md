@@ -31,8 +31,15 @@ SwiftOS kernel 1.0.0-aarch64 (Embedded Swift, bare metal)
 - GICv2 + ARM generic timer (100 Hz tick), full exception vector table
 - **Preemptive round-robin kernel threads** (50 ms quantum, context switch in
   the timer IRQ) with real per-thread CPU accounting
+- **EL0 userspace with an SVC syscall ABI** (write/uptime/exit/yield) — the
+  `udemo` command runs an unprivileged position-independent blob that talks
+  to the kernel through `svc`, survives IRQ preemption, and is killed (not
+  the kernel) on any fault
 - **virtio-blk storage** + **SwiftFS**, our own filesystem (superblock, 256
   inodes, bitmap allocator, write-through) — files survive reboots
+- **Networking**: virtio-net driver + ethernet/ARP/IPv4/ICMP stack — `ping`
+  gets real echo replies, and the kernel answers pings addressed to it
+- **Power**: PSCI shutdown/reboot (`shutdown` powers the VM off for real)
 - fw_cfg/**ramfb** 1280×800 display, double-buffered, software-composited
 - **virtio-mmio** keyboard + tablet (absolute mouse), plus serial input
 
@@ -40,15 +47,19 @@ SwiftOS kernel 1.0.0-aarch64 (Embedded Swift, bare metal)
 - Window manager (drag/resize/minimize/maximize/focus), desktop environment
   (boot splash fed by the real kernel log, panel, taskbar, icons, context menu)
 - Terminal emulator (scrollback, history, tab completion, **ANSI SGR colors**)
-- `swish` shell: ~30 commands (`ls`, `cat`, `grep`, `ps`, `kill`, `neofetch`,
-  `nano`, `top`, `open`…), pipes, `>`/`>>` redirection, `~`/`$VAR` expansion
+- `swish` shell: ~35 commands (`ls`, `cat`, `grep`, `ps`, `kill`, `ping`,
+  `tree`, `du`, `mv`, `neofetch`, `nano`, `top`, `open`, `shutdown`…),
+  pipes, `>`/`>>` redirection, `~`/`$VAR` expansion
+- Interactive **htop-style `top`** mode inside the terminal (live process
+  table, `q` quits)
 - In-memory-or-persistent Linux-like VFS (`typed throws(VFSError)`)
 - Apps: file manager, text editor (soft-wrap, save), htop-style system monitor
   reading **real** kernel data (tasks, CPU%, allocator, uptime, load)
 - Software rasterizer (paired-pixel fills, glyph-run text) with a
   build-time-generated 8×16 Menlo bitmap font
-- Shortcuts: Ctrl+Alt+T new terminal, Ctrl+Alt+W close window, right-click
-  desktop menu
+- Shortcuts: Ctrl+Alt+T new terminal, Ctrl+Alt+W close window, **Alt+drag**
+  move / Alt+right-drag resize windows (Metacity-style), right-click desktop
+  menu, panel power menu
 
 ## Quickstart
 
@@ -105,12 +116,13 @@ alignment faults, unicode shims, QEMU quirks).
 ## Current limitations
 
 - Targets QEMU `virt`; real Apple Silicon bring-up is future work
-- Cooperative userland (kernel threads are preemptive; apps share the
-  compositor thread). No EL0 userspace / syscall ABI yet
+- Apps share the compositor thread (kernel threads are preemptive; EL0 is a
+  single synchronous demo run, not yet scheduled user processes)
+- Networking is IPv4+ICMP so far — no TCP/UDP yet
 - Unicode support is ASCII-correct; shell has `;` but not `&&`
 - TCG emulation speed, not the kernel, limits frame rate
 
 ## Roadmap ideas
 
-EL0 userspace + syscalls · virtio-net + TCP/IP · interactive `top` ·
-preemptive user processes · real-hardware device tree
+Scheduled EL0 user processes with per-process page tables · UDP/TCP ·
+real-hardware device tree · SMP
