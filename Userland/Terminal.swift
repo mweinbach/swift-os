@@ -48,7 +48,8 @@ public final class TerminalApp: OSApp {
     // MARK: OSApp
 
     public override init() {
-        appendLine([(text: "SwiftOS 1.0 (kernel 6.9.4-swift)", color: .terminalText)])
+        super.init()
+        appendLine([(text: "SwiftOS 1.0 (kernel 1.0.0-aarch64)", color: .terminalText)])
         appendLine([(text: "Type 'help' to get started.", color: .gray)])
     }
 

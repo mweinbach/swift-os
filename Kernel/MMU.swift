@@ -57,11 +57,16 @@ enum MMU {
     // inner+outer write-back, read/write allocate).
     private static let mairValue: UInt64 = 0x04 | (0xFF << 8)
 
-    // TCR_EL1: T0SZ=24 (see header) | IRGN0=0b01 WB | ORGN0=0b01 WB |
-    // SH0=0b11 inner-shareable | TG0=0b00 (4 KiB) | EPD1=1 (never walk
-    // TTBR1) | IPS=0b010 (40-bit PA).  = 0x2_0080_3518
+    // TCR_EL1 fields (combined value = 0x2_0080_3518):
+    private static let tcrT0SZ:  UInt64 = 24        // 40-bit VA (see header)
+    private static let tcrIRGN0: UInt64 = 1 << 8    // inner WB RA/WA
+    private static let tcrORGN0: UInt64 = 1 << 10   // outer WB RA/WA
+    private static let tcrSH0:   UInt64 = 3 << 12   // inner shareable
+    // TG0 = 0b00 (4 KiB granule) needs no bits set.
+    private static let tcrEPD1:  UInt64 = 1 << 23   // never walk TTBR1
+    private static let tcrIPS:   UInt64 = 2 << 32   // 40-bit PA (1 TB)
     private static let tcrValue: UInt64 =
-        24 | (1 << 8) | (1 << 10) | (3 << 12) | (1 << 23) | (2 << 32)
+        tcrT0SZ | tcrIRGN0 | tcrORGN0 | tcrSH0 | tcrEPD1 | tcrIPS
 
     // Descriptor field bits.
     private static let descBlock: UInt64 = 0b01       // valid block entry

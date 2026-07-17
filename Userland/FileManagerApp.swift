@@ -45,7 +45,7 @@ final class FileManagerApp: OSApp {
     private var statusMessageIsError = false
     private var statusMessageTTL: TimeInterval = 0
     private var lastClickName: String?
-    private var lastClickTime: UInt64 = 0 // wall-clock ms (Platform.services.wallClockMs)
+    private var lastClickTime: UInt64 = 0 // monotonic ms (Platform.services.uptimeMs)
     private var reloadAccumulator: TimeInterval = 0
 
     // MARK: - Hit geometry (recomputed every draw)
@@ -89,13 +89,14 @@ final class FileManagerApp: OSApp {
         reload()
     }
 
-    override init(path: String) {
+    /// New designated signature (the OSApp base only has `init()`), so no `override`.
+    init(path: String) {
         self.initialPath = path
         let start = FileManagerApp.resolveStartPath(path)
         self.currentPath = start
         self.history = [start]
         self.historyIndex = 0
-        super.init(path: path)
+        super.init()
         reload()
     }
 
@@ -711,7 +712,7 @@ final class FileManagerApp: OSApp {
             return
         }
         let node = entries[row]
-        let now = Platform.services.wallClockMs
+        let now = Platform.services.uptimeMs
         if node.name == lastClickName && now - lastClickTime < 350 {
             // Double-click (< 0.35s): open directory or file.
             lastClickName = nil

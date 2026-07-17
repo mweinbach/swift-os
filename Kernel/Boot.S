@@ -103,3 +103,10 @@ __stack_chk_guard:
 stack:
     .skip   65536
 stack_top:
+
+// Unicode data shim (data symbol) — see Support.swift.
+.data
+.globl _swift_stdlib_nfd_decompositions
+.hidden _swift_stdlib_nfd_decompositions
+_swift_stdlib_nfd_decompositions:
+    .byte 0

@@ -265,7 +265,7 @@ final class VFS {
         """)
 
         let motd = FSNode.file("motd", """
-        Welcome to SwiftOS 1.0 (kernel 6.9.4-swift)
+        Welcome to SwiftOS 1.0 (kernel 1.0.0-aarch64)
 
          * Documentation:  /usr/share/doc
          * Support:        https://swiftos.dev/support
@@ -275,9 +275,10 @@ final class VFS {
         Welcome to SwiftOS!
         ===================
 
-        This is your home directory. Everything in this system is a
-        simulation written in Swift and rendered with Metal -- the
-        filesystem, this file, and the terminal you are reading it in.
+        This is your home directory. Everything on this system is written
+        in Swift and runs on our own bare-metal kernel: the drivers, the
+        window manager, this filesystem, and the terminal you are
+        reading it in. No Linux, no Apple frameworks.
 
         Tips:
           * Run `neofetch` to see a summary of the system.

@@ -630,7 +630,19 @@ final class Shell {
         }
         guard let text else { return "" }
         // Plain substring match only — no regex engine in the kernel.
-        return logicalLines(text).filter { $0.contains(pattern) }.joined(separator: "\n")
+        return logicalLines(text).filter { containsSubstring($0, pattern) }.joined(separator: "\n")
+    }
+
+    /// Stdlib-only substring test (Foundation's `String.contains(_: String)`
+    /// does not exist in the kernel). Empty pattern matches everything.
+    private func containsSubstring(_ text: String, _ pattern: String) -> Bool {
+        if pattern.isEmpty { return true }
+        var i = text.startIndex
+        while i < text.endIndex {
+            if text[i...].hasPrefix(pattern) { return true }
+            i = text.index(after: i)
+        }
+        return false
     }
 
     private func cmdWC(_ args: [String], stdin: String?) -> String {
@@ -782,7 +794,7 @@ final class Shell {
     }
 
     private func cmdNeofetch() -> String {
-        let services = Platform.services
+        let services: KernelServices = Platform.services
         let user = environment["USER"] ?? "user"
         let host = environment["HOSTNAME"] ?? "swiftos"
         let info: [String] = [

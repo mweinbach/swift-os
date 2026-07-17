@@ -152,7 +152,7 @@ final class Desktop {
         }
         let loginTime = Double(log.count) * bootLineInterval + bootLoginDelay
         if bootElapsed >= loginTime {
-            let k = Platform.services
+            let k: KernelServices = Platform.services
             let dim = Color.terminalText.withAlpha(0.55)
             y += lineHeight / 2
             surface.text("\(k.osName) \(k.osVersion) \(k.hostname) tty1",
@@ -209,7 +209,7 @@ final class Desktop {
         }
         drawWallpaperGlyph(surface, size: size)
 
-        let k = Platform.services
+        let k: KernelServices = Platform.services
         let version = "\(k.osName) \(k.osVersion) (kernel \(k.kernelRelease))"
         let vs = surface.textSize(version)
         surface.text(version,

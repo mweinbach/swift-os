@@ -24,15 +24,17 @@ enum Display {
     private static var fbAddr: UInt = 0
     private static var backAddr: UInt = 0
 
-    // fw_cfg MMIO registers (QEMU virt).
+    // fw_cfg MMIO registers (QEMU virt). NOTE: the selector and DMA
+    // registers are DEVICE_BIG_ENDIAN — values must be byte-swapped on
+    // write. (The data port is byte-oriented, so reads need no swap.)
     private enum FwCfg {
         static let data: UInt     = 0x0902_0000
         static let selector: UInt = 0x0902_0008
-        static let dma: UInt      = 0x0902_0010   // 64-bit: address of FWCfgDmaAccess
-        // DMA control bits; the selector rides in the upper 16 bits. A
-        // transfer without ctlRead is a write (guest -> device).
+        static let dma: UInt      = 0x0902_0010   // 64-bit BE: address of FWCfgDmaAccess
+        // DMA control bits; the selector rides in the upper 16 bits.
         static let ctlRead: UInt32   = 0x02
         static let ctlSelect: UInt32 = 0x08
+        static let ctlWrite: UInt32  = 0x10
         static let fileDirKey: UInt32 = 0x19      // FW_CFG_FILE_DIR
     }
 
@@ -70,7 +72,7 @@ enum Display {
 
         let frontPtr = UnsafeMutableRawPointer(bitPattern: front)!
         fillColor(frontPtr, color: 0xFF1B_1E25, bytes: bytes)
-        memset_(UnsafeMutableRawPointer(bitPattern: back), 0, bytes)
+        _ = memset_(UnsafeMutableRawPointer(bitPattern: back), 0, bytes)
 
         guard let selector = findRamfbSelector() else {
             klog("[fb] ramfb: etc/ramfb not present (boot with -device ramfb)")
@@ -83,14 +85,17 @@ enum Display {
             klog("[fb] ramfb: config allocation failed")
             return false
         }
-        cfg.storeBytes(of: UInt64(front).bigEndian, toByteOffset: 0, as: UInt64.self)
-        cfg.storeBytes(of: UInt32(0x3432_5258).bigEndian, toByteOffset: 8, as: UInt32.self) // 'XR24'
-        cfg.storeBytes(of: UInt32(0).bigEndian, toByteOffset: 12, as: UInt32.self)
-        cfg.storeBytes(of: UInt32(w).bigEndian, toByteOffset: 16, as: UInt32.self)
-        cfg.storeBytes(of: UInt32(h).bigEndian, toByteOffset: 20, as: UInt32.self)
-        cfg.storeBytes(of: UInt32(stride).bigEndian, toByteOffset: 24, as: UInt32.self)
-        fwCfgDma(control: (selector << 16) | FwCfg.ctlSelect,
-                 length: 28, address: UInt(bitPattern: cfg))
+        storeBE64(cfg, 0, UInt64(front))
+        storeBE32(cfg, 8, 0x3432_5258)   // fourcc 'XR24' = DRM_FORMAT_XRGB8888
+        storeBE32(cfg, 12, 0)            // flags
+        storeBE32(cfg, 16, UInt32(w))
+        storeBE32(cfg, 20, UInt32(h))
+        storeBE32(cfg, 24, UInt32(stride))
+        if !fwCfgDma(control: (selector << 16) | FwCfg.ctlSelect | FwCfg.ctlWrite,
+                     length: 28, address: UInt(bitPattern: cfg)) {
+            klog("[fb] ramfb: config DMA write failed")
+            return false
+        }
 
         fbAddr = front
         backAddr = back
@@ -105,34 +110,39 @@ enum Display {
     /// Copy the composited frame (back -> front).
     static func present() {
         if strideBytes == 0 { return }
-        memcpy_(framebuffer, backBuffer, strideBytes * height)
+        _ = memcpy_(framebuffer, backBuffer, strideBytes * height)
     }
 
     // MARK: - fw_cfg DMA
 
     /// One fw_cfg DMA transfer. control/length/address are stored big-endian
     /// into the FWCfgDmaAccess descriptor; writing the descriptor's physical
-    /// address to the DMA register performs the transfer synchronously.
-    private static func fwCfgDma(control: UInt32, length: UInt32, address: UInt) {
+    /// address (also big-endian — the register's ops are DEVICE_BIG_ENDIAN)
+    /// to the DMA register performs the transfer synchronously. QEMU writes
+    /// the result back into the descriptor's control field: 0 = ok,
+    /// FW_CFG_DMA_CTL_ERROR(1) = failed. Returns true on success.
+    @discardableResult
+    private static func fwCfgDma(control: UInt32, length: UInt32, address: UInt) -> Bool {
         let desc = UnsafeMutableRawPointer(bitPattern: dmaDescAddr)!
-        desc.storeBytes(of: control.bigEndian, toByteOffset: 0, as: UInt32.self)
-        desc.storeBytes(of: length.bigEndian, toByteOffset: 4, as: UInt32.self)
-        desc.storeBytes(of: UInt64(address).bigEndian, toByteOffset: 8, as: UInt64.self)
-        mmioWrite64(FwCfg.dma, UInt64(dmaDescAddr))
+        storeBE32(desc, 0, control)
+        storeBE32(desc, 4, length)
+        storeBE64(desc, 8, UInt64(address))
+        mmioWrite64(FwCfg.dma, UInt64(dmaDescAddr).bigEndian)
+        return desc.load(fromByteOffset: 0, as: UInt32.self).bigEndian == 0
     }
 
     /// Read the fw_cfg file directory and return the selector for
     /// "etc/ramfb", or nil when ramfb is not attached.
     private static func findRamfbSelector() -> UInt32? {
         guard let countBuf = KernelHeap.alloc(size: 4, alignment: 4) else { return nil }
-        fwCfgDma(control: (FwCfg.fileDirKey << 16) | FwCfg.ctlSelect | FwCfg.ctlRead,
-                 length: 4, address: UInt(bitPattern: countBuf))
+        guard fwCfgDma(control: (FwCfg.fileDirKey << 16) | FwCfg.ctlSelect | FwCfg.ctlRead,
+                       length: 4, address: UInt(bitPattern: countBuf)) else { return nil }
         let count = Int(countBuf.load(as: UInt32.self).bigEndian)
         if count <= 0 || count > 4096 { return nil }
 
         guard let dir = KernelHeap.alloc(size: count * 64, alignment: 4) else { return nil }
-        fwCfgDma(control: FwCfg.ctlRead, length: UInt32(count * 64),
-                 address: UInt(bitPattern: dir))
+        guard fwCfgDma(control: FwCfg.ctlRead, length: UInt32(count * 64),
+                       address: UInt(bitPattern: dir)) else { return nil }
 
         // FWCfgFile: u32 size, u16 select, u16 reserved, char name[56].
         let target = "etc/ramfb"
@@ -156,6 +166,20 @@ enum Display {
     }
 
     // MARK: - helpers
+
+    // Big-endian field stores, deliberately not inlinable: at -Osize the
+    // compiler otherwise fuses runs of adjacent storeBytes into single
+    // 16-byte NEON stores, which alignment-fault on device memory (the MMU
+    // is off) unless the address happens to be 16-byte aligned.
+    @inline(never)
+    private static func storeBE32(_ p: UnsafeMutableRawPointer, _ off: Int, _ v: UInt32) {
+        p.storeBytes(of: v.bigEndian, toByteOffset: off, as: UInt32.self)
+    }
+
+    @inline(never)
+    private static func storeBE64(_ p: UnsafeMutableRawPointer, _ off: Int, _ v: UInt64) {
+        p.storeBytes(of: v.bigEndian, toByteOffset: off, as: UInt64.self)
+    }
 
     private static func fillColor(_ p: UnsafeMutableRawPointer, color: UInt32, bytes: Int) {
         let pair = UInt64(color) << 32 | UInt64(color)
