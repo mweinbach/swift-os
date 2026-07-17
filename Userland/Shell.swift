@@ -4,12 +4,18 @@
 
 /// "swish" — a small bash-like shell for SwiftOS. Parses one line at a time:
 /// quote-aware tokenizing, `;` command separators, a `|` pipeline stage, and
-/// `>` / `>>` redirection into the VFS. Output is plain text (no ANSI codes).
+/// `>` / `>>` redirection into the VFS. Command output may carry ANSI SGR
+/// color (ls/grep/errors); the terminal strips and renders it (parseSGR).
 final class Shell {
     let fs: VFS
     var cwd: String
     var environment: [String: String]
     private(set) var history: [String] = []
+
+    /// False while a command's output is NOT going straight to the terminal —
+    /// a non-final pipeline stage or a `>`/`>>` redirection. SGR color is then
+    /// suppressed so escape bytes never corrupt downstream commands or files.
+    private var colorEnabled = true
 
     init(fs: VFS = .shared) {
         self.fs = fs
@@ -38,9 +44,9 @@ final class Shell {
     }
 
     /// Executes one command line and returns its full output (may be multiple lines,
-    /// no trailing newline). Plain text only — NO ANSI escape codes; the terminal
-    /// colors the prompt and its own UI itself. Every executed line is appended to
-    /// `history`.
+    /// no trailing newline). Output may contain ANSI SGR color sequences (see
+    /// `colorEnabled`); the terminal renders them, while the prompt itself is
+    /// colored by the terminal. Every executed line is appended to `history`.
     @discardableResult
     func execute(_ line: String) -> String {
         history.append(line)
@@ -247,6 +253,17 @@ final class Shell {
         return result
     }
 
+    /// ASCII [A-Za-z0-9_] test via scalar values — the kernel's unicode data
+    /// stubs make `Character.isLetter`/`isNumber` return true for EVERY
+    /// character, which would let a $VAR name scan run to end-of-string.
+    private func isVarNameChar(_ c: Character) -> Bool {
+        guard let v = c.unicodeScalars.first, c.unicodeScalars.count == 1 else { return false }
+        return (v.value >= 48 && v.value <= 57)      // 0-9
+            || (v.value >= 65 && v.value <= 90)      // A-Z
+            || (v.value >= 97 && v.value <= 122)     // a-z
+            || v.value == 95                         // _
+    }
+
     /// Expands `$VAR` and `${VAR}` from the environment; escape-marked
     /// characters are emitted literally.
     private func expandVariables(in text: String) -> String {
@@ -279,7 +296,7 @@ final class Shell {
                     continue
                 }
                 var name = ""
-                while j < text.endIndex, text[j].isLetter || text[j].isNumber || text[j] == "_" {
+                while j < text.endIndex, isVarNameChar(text[j]) {
                     name.append(text[j])
                     j = text.index(after: j)
                 }
@@ -303,10 +320,14 @@ final class Shell {
         }
         var input: String? = nil
         var output = ""
-        for stage in stages {
+        for (index, stage) in stages.enumerated() {
+            // Only the final stage writes to the terminal — earlier stages
+            // feed the next command, where SGR bytes would corrupt parsing.
+            colorEnabled = index == stages.count - 1
             output = runSimple(stage, stdin: input)
             input = output.isEmpty ? nil : output
         }
+        colorEnabled = true
         return output
     }
 
@@ -325,7 +346,7 @@ final class Shell {
                     redirect = (expandWord(segments), append)
                     i += 1
                 } else {
-                    return "swish: syntax error near unexpected token `>'"
+                    return sgrError("swish: syntax error near unexpected token `>'")
                 }
             case .semicolon, .pipe:
                 break
@@ -337,11 +358,12 @@ final class Shell {
             // e.g. a bare `> file` just truncates/creates the file.
             if let r = redirect {
                 do { try fs.write(VFS.normalize(r.path, cwd: cwd), contents: "") }
-                catch { return "swish: \(vfsErrorMessage(r.path, error))" }
+                catch { return sgrError("swish: \(vfsErrorMessage(r.path, error))") }
             }
             return ""
         }
 
+        if redirect != nil { colorEnabled = false } // colors never leak into files
         let output = dispatch(command, args: Array(words.dropFirst()), stdin: stdin)
 
         if let r = redirect {
@@ -350,10 +372,31 @@ final class Shell {
             let full = VFS.normalize(r.path, cwd: cwd)
             if r.append { text = ((try? fs.read(full)) ?? "") + text }
             do { try fs.write(full, contents: text) }
-            catch { return "swish: \(vfsErrorMessage(r.path, error))" }
+            catch { return sgrError("swish: \(vfsErrorMessage(r.path, error))") }
             return ""
         }
         return output
+    }
+
+    // MARK: - ANSI SGR output (rendered by TerminalApp.parseSGR)
+
+    /// Wraps an error message in red — suppressed when piped or redirected.
+    private func sgrError(_ message: String) -> String {
+        guard colorEnabled else { return message }
+        return "\u{1B}[31m" + message + "\u{1B}[0m"
+    }
+
+    /// A file name colored ls-style: directories bright blue, files with an
+    /// executable permission bit green (both suppressed when piped/redirected).
+    private func colorizedName(_ node: VNode) -> String {
+        guard colorEnabled else { return node.name }
+        if node.permissions.hasPrefix("d") {
+            return "\u{1B}[1;34m" + node.name + "\u{1B}[0m"
+        }
+        if node.permissions.contains("x") {
+            return "\u{1B}[32m" + node.name + "\u{1B}[0m"
+        }
+        return node.name
     }
 
     // MARK: - Command dispatch
@@ -398,12 +441,15 @@ final class Shell {
         case "which": return cmdWhich(args)
         case "man": return cmdMan(args)
         case "neofetch": return cmdNeofetch()
+        case "kill": return cmdKill(args)
+        case "nano": return cmdNano(args)
+        case "top": return cmdTop(args)
         case "sudo":
             return "user is not in the sudoers file. This incident will be reported."
         case "open": return cmdOpen(args)
         case "exit", "clear": return ""
         default:
-            return "swish: \(command): command not found"
+            return sgrError("swish: \(command): command not found")
         }
     }
 
@@ -418,7 +464,7 @@ final class Shell {
                     switch flag {
                     case "l": long = true
                     case "a": all = true
-                    default: return "ls: invalid option -- '\(flag)'"
+                    default: return sgrError("ls: invalid option -- '\(flag)'")
                     }
                 }
             } else if path == nil {
@@ -431,26 +477,26 @@ final class Shell {
         if fs.isDirectory(full) {
             var nodes: [VNode]
             do { nodes = try fs.list(full) }
-            catch { return "ls: \(vfsErrorMessage(target, error))" }
+            catch { return sgrError("ls: \(vfsErrorMessage(target, error))") }
             if !all { nodes = nodes.filter { !$0.name.hasPrefix(".") } }
             if long {
                 return nodes.map { longFormat($0) }.joined(separator: "\n")
             }
-            return columnize(nodes.map { $0.name })
+            return columnize(nodes)
         }
         do {
             let node = try fs.node(at: full)
-            return long ? longFormat(node) : node.name
+            return long ? longFormat(node) : colorizedName(node)
         } catch {
-            return "ls: \(vfsErrorMessage(target, error))"
+            return sgrError("ls: \(vfsErrorMessage(target, error))")
         }
     }
 
     private func cmdCD(_ args: [String]) -> String {
         let target = args.first ?? environment["HOME"] ?? "/home/user"
         let full = VFS.normalize(target, cwd: cwd)
-        guard fs.exists(full) else { return "cd: \(target): No such file or directory" }
-        guard fs.isDirectory(full) else { return "cd: \(target): Not a directory" }
+        guard fs.exists(full) else { return sgrError("cd: \(target): No such file or directory") }
+        guard fs.isDirectory(full) else { return sgrError("cd: \(target): Not a directory") }
         environment["OLDPWD"] = cwd
         cwd = full
         environment["PWD"] = full
@@ -465,7 +511,7 @@ final class Shell {
                 result += try fs.read(VFS.normalize(file, cwd: cwd))
             } catch {
                 if !result.isEmpty, !result.hasSuffix("\n") { result += "\n" }
-                result += "cat: \(vfsErrorMessage(file, error))\n"
+                result += sgrError("cat: \(vfsErrorMessage(file, error))") + "\n"
             }
         }
         return result
@@ -478,22 +524,22 @@ final class Shell {
     }
 
     private func cmdTouch(_ args: [String]) -> String {
-        if args.isEmpty { return "touch: missing file operand" }
+        if args.isEmpty { return sgrError("touch: missing file operand") }
         var errors: [String] = []
         for file in args {
             let full = VFS.normalize(file, cwd: cwd)
             do { try fs.write(full, contents: (try? fs.read(full)) ?? "") }
-            catch { errors.append("touch: \(vfsErrorMessage(file, error))") }
+            catch { errors.append(sgrError("touch: \(vfsErrorMessage(file, error))")) }
         }
         return errors.joined(separator: "\n")
     }
 
     private func cmdMkdir(_ args: [String]) -> String {
-        if args.isEmpty { return "mkdir: missing operand" }
+        if args.isEmpty { return sgrError("mkdir: missing operand") }
         var errors: [String] = []
         for dir in args {
             do { try fs.mkdir(VFS.normalize(dir, cwd: cwd)) }
-            catch { errors.append("mkdir: \(vfsErrorMessage(dir, error))") }
+            catch { errors.append(sgrError("mkdir: \(vfsErrorMessage(dir, error))")) }
         }
         return errors.joined(separator: "\n")
     }
@@ -507,27 +553,27 @@ final class Shell {
                     switch flag {
                     case "r", "R": recursive = true
                     case "f": force = true
-                    default: return "rm: invalid option -- '\(flag)'"
+                    default: return sgrError("rm: invalid option -- '\(flag)'")
                     }
                 }
             } else {
                 targets.append(arg)
             }
         }
-        if targets.isEmpty { return "rm: missing operand" }
+        if targets.isEmpty { return sgrError("rm: missing operand") }
         var errors: [String] = []
         for target in targets {
             let full = VFS.normalize(target, cwd: cwd)
             guard fs.exists(full) else {
-                if !force { errors.append("rm: \(target): No such file or directory") }
+                if !force { errors.append(sgrError("rm: \(target): No such file or directory")) }
                 continue
             }
             if fs.isDirectory(full), !recursive {
-                errors.append("rm: \(target): Is a directory")
+                errors.append(sgrError("rm: \(target): Is a directory"))
                 continue
             }
             do { try removeTree(full) }
-            catch { errors.append("rm: \(vfsErrorMessage(target, error))") }
+            catch { errors.append(sgrError("rm: \(vfsErrorMessage(target, error))")) }
         }
         return errors.joined(separator: "\n")
     }
@@ -539,47 +585,47 @@ final class Shell {
             if arg.hasPrefix("-"), arg.count > 1 {
                 for flag in arg.dropFirst() {
                     if flag == "r" || flag == "R" { recursive = true }
-                    else { return "cp: invalid option -- '\(flag)'" }
+                    else { return sgrError("cp: invalid option -- '\(flag)'") }
                 }
             } else {
                 operands.append(arg)
             }
         }
-        if operands.isEmpty { return "cp: missing file operand" }
+        if operands.isEmpty { return sgrError("cp: missing file operand") }
         if operands.count == 1 {
-            return "cp: missing destination file operand after '\(operands[0])'"
+            return sgrError("cp: missing destination file operand after '\(operands[0])'")
         }
         let source = VFS.normalize(operands[0], cwd: cwd)
         var dest = VFS.normalize(operands[1], cwd: cwd)
         guard fs.exists(source) else {
-            return "cp: \(operands[0]): No such file or directory"
+            return sgrError("cp: \(operands[0]): No such file or directory")
         }
         if fs.isDirectory(source), !recursive {
-            return "cp: \(operands[0]): Is a directory"
+            return sgrError("cp: \(operands[0]): Is a directory")
         }
         if fs.isDirectory(dest) { dest += "/" + VFS.basename(source) }
         do { try copyTree(source, dest) }
-        catch { return "cp: \(vfsErrorMessage(operands[1], error))" }
+        catch { return sgrError("cp: \(vfsErrorMessage(operands[1], error))") }
         return ""
     }
 
     private func cmdMV(_ args: [String]) -> String {
         let operands = args.filter { !$0.hasPrefix("-") }
-        if operands.isEmpty { return "mv: missing file operand" }
+        if operands.isEmpty { return sgrError("mv: missing file operand") }
         if operands.count == 1 {
-            return "mv: missing destination file operand after '\(operands[0])'"
+            return sgrError("mv: missing destination file operand after '\(operands[0])'")
         }
         let source = VFS.normalize(operands[0], cwd: cwd)
         var dest = VFS.normalize(operands[1], cwd: cwd)
         guard fs.exists(source) else {
-            return "mv: \(operands[0]): No such file or directory"
+            return sgrError("mv: \(operands[0]): No such file or directory")
         }
         if fs.isDirectory(dest) { dest += "/" + VFS.basename(source) }
         do {
             try copyTree(source, dest)
             try removeTree(source)
         } catch {
-            return "mv: \(vfsErrorMessage(operands[1], error))"
+            return sgrError("mv: \(vfsErrorMessage(operands[1], error))")
         }
         return ""
     }
@@ -608,7 +654,7 @@ final class Shell {
         let text: String
         if let file {
             do { text = try fs.read(VFS.normalize(file, cwd: cwd)) }
-            catch { return "\(name): \(vfsErrorMessage(file, error))" }
+            catch { return sgrError("\(name): \(vfsErrorMessage(file, error))") }
         } else if let stdin {
             text = stdin
         } else {
@@ -620,17 +666,38 @@ final class Shell {
     }
 
     private func cmdGrep(_ args: [String], stdin: String?) -> String {
-        guard let pattern = args.first else { return "usage: grep <pattern> [file]" }
+        guard let pattern = args.first else { return sgrError("usage: grep <pattern> [file]") }
         let text: String?
         if args.count > 1 {
             do { text = try fs.read(VFS.normalize(args[1], cwd: cwd)) }
-            catch { return "grep: \(vfsErrorMessage(args[1], error))" }
+            catch { return sgrError("grep: \(vfsErrorMessage(args[1], error))") }
         } else {
             text = stdin
         }
         guard let text else { return "" }
         // Plain substring match only — no regex engine in the kernel.
-        return logicalLines(text).filter { containsSubstring($0, pattern) }.joined(separator: "\n")
+        let matches = logicalLines(text).filter { containsSubstring($0, pattern) }
+        // Highlight only when this output goes straight to the terminal; a
+        // downstream pipe or file would receive the raw escape bytes.
+        guard colorEnabled else { return matches.joined(separator: "\n") }
+        return matches.map { highlight($0, pattern: pattern) }.joined(separator: "\n")
+    }
+
+    /// Bold-red SGR around every occurrence of `pattern` in `line`.
+    private func highlight(_ line: String, pattern: String) -> String {
+        if pattern.isEmpty { return line }
+        var result = ""
+        var i = line.startIndex
+        while i < line.endIndex {
+            if line[i...].hasPrefix(pattern) {
+                result += "\u{1B}[1;31m" + pattern + "\u{1B}[0m"
+                i = line.index(i, offsetBy: pattern.count)
+            } else {
+                result.append(line[i])
+                i = line.index(after: i)
+            }
+        }
+        return result
     }
 
     /// Stdlib-only substring test (Foundation's `String.contains(_: String)`
@@ -650,14 +717,14 @@ final class Shell {
         var file: String? = nil
         for arg in args {
             if arg == "-l" { linesOnly = true }
-            else if arg.hasPrefix("-") { return "wc: invalid option -- '\(arg.dropFirst().first ?? " ")'" }
+            else if arg.hasPrefix("-") { return sgrError("wc: invalid option -- '\(arg.dropFirst().first ?? " ")'") }
             else { file = arg }
         }
         let text: String
         var label = ""
         if let file {
             do { text = try fs.read(VFS.normalize(file, cwd: cwd)) }
-            catch { return "wc: \(vfsErrorMessage(file, error))" }
+            catch { return sgrError("wc: \(vfsErrorMessage(file, error))") }
             label = " " + file
         } else if let stdin {
             text = stdin
@@ -675,7 +742,7 @@ final class Shell {
     private func cmdFind(_ args: [String]) -> String {
         let base = args.first ?? "."
         let full = VFS.normalize(base, cwd: cwd)
-        guard fs.exists(full) else { return "find: \(base): No such file or directory" }
+        guard fs.exists(full) else { return sgrError("find: \(base): No such file or directory") }
         var results: [String] = []
         func walk(_ display: String, _ absolute: String) {
             results.append(display)
@@ -790,7 +857,7 @@ final class Shell {
     private func cmdMan(_ args: [String]) -> String {
         guard let topic = args.first else { return "What manual page do you want?" }
         if let page = Shell.manPages[topic] { return page }
-        return "No manual entry for \(topic)"
+        return sgrError("No manual entry for \(topic)")
     }
 
     private func cmdNeofetch() -> String {
@@ -825,15 +892,42 @@ final class Shell {
     }
 
     private func cmdOpen(_ args: [String]) -> String {
-        guard let target = args.first else { return "usage: open <path>" }
+        guard let target = args.first else { return sgrError("usage: open <path>") }
         let full = VFS.normalize(target, cwd: cwd)
-        guard fs.exists(full) else { return "open: \(target): No such file or directory" }
+        guard fs.exists(full) else { return sgrError("open: \(target): No such file or directory") }
         if fs.isDirectory(full) {
             WindowManager.shared.open(app: FileManagerApp(path: full))
         } else {
             WindowManager.shared.open(app: TextEditorApp(path: full))
         }
         return "Opening \(full)"
+    }
+
+    /// `kill <pid>` — closes the window whose process owns that PID (window
+    /// processes are the only user-space processes that really exist here).
+    private func cmdKill(_ args: [String]) -> String {
+        guard let arg = args.first, let pid = Int(arg) else {
+            return sgrError("usage: kill <pid>")
+        }
+        if let window = WindowManager.shared.windows.first(where: { $0.processPID == pid }) {
+            WindowManager.shared.close(window)
+            return "killed \(pid)"
+        }
+        return sgrError("kill: \(pid): Operation not permitted")
+    }
+
+    /// `nano <file>` — the Text Editor stands in for nano; like the real nano
+    /// it happily opens files that do not exist yet (created on save).
+    private func cmdNano(_ args: [String]) -> String {
+        guard let file = args.first else { return sgrError("usage: nano <file>") }
+        WindowManager.shared.open(app: TextEditorApp(path: VFS.normalize(file, cwd: cwd)))
+        return "Opening \(file)"
+    }
+
+    /// `top` — the System Monitor is the interactive process viewer.
+    private func cmdTop(_ args: [String]) -> String {
+        WindowManager.shared.open(app: SystemMonitorApp())
+        return "System Monitor opened (q quits processes there)"
     }
 
     // MARK: - Recursive helpers
@@ -891,22 +985,27 @@ final class Shell {
 
     private func longFormat(_ node: VNode) -> String {
         pad(node.permissions, to: 11) + pad(String(node.size), to: 7) + " "
-            + TimeFmt.fileDate(node.modified) + " " + node.name
+            + TimeFmt.fileDate(node.modified) + " " + colorizedName(node)
     }
 
-    private func columnize(_ names: [String]) -> String {
-        if names.isEmpty { return "" }
-        let columnWidth = (names.map { $0.count }.max() ?? 0) + 2
+    /// Column layout uses the VISIBLE name widths; SGR bytes are added around
+    /// each padded cell so alignment survives the color codes.
+    private func columnize(_ nodes: [VNode]) -> String {
+        if nodes.isEmpty { return "" }
+        let columnWidth = (nodes.map { $0.name.count }.max() ?? 0) + 2
         let columns = max(1, 80 / max(1, columnWidth))
-        let rows = (names.count + columns - 1) / columns
+        let rows = (nodes.count + columns - 1) / columns
         var lines: [String] = []
         for row in 0..<rows {
             var line = ""
             for column in 0..<columns {
                 let index = column * rows + row
-                guard index < names.count else { continue }
-                let name = names[index]
-                line += column == columns - 1 ? name : padLeft(name, to: columnWidth)
+                guard index < nodes.count else { continue }
+                let node = nodes[index]
+                line += colorizedName(node)
+                if column != columns - 1 {
+                    line += String(repeating: " ", count: max(0, columnWidth - node.name.count))
+                }
             }
             while line.hasSuffix(" ") { line.removeLast() }
             lines.append(line)
@@ -970,6 +1069,8 @@ final class Shell {
           whoami                 print the current user
           hostname               print the system hostname
           ps [aux]               print the process table
+          kill <pid>             close the app window owning a process
+          top                    open the System Monitor (process viewer)
           uptime                 uptime and load average
           date                   current date and time
           df [-h]                disk usage
@@ -981,6 +1082,7 @@ final class Shell {
           man <cmd>              read a manual page
           neofetch               system summary with logo
           open <path>            open a file or folder in a GUI app
+          nano <file>            edit a file in the Text Editor
           sudo <cmd>             attempt privilege escalation
           clear                  clear the screen
           exit                   close the terminal
@@ -1085,6 +1187,23 @@ final class Shell {
         "neofetch": """
         neofetch(1) - display system information next to a fancy logo
         usage: neofetch
+        """,
+        "kill": """
+        kill(1) - terminate a process
+        usage: kill <pid>
+        Closes the window that owns the process (see `ps` for PIDs). Only
+        window-backed processes can be killed; anything else is not permitted.
+        """,
+        "nano": """
+        nano(1) - edit a file
+        usage: nano <file>
+        Opens the file in the Text Editor. A missing file starts empty and is
+        created when you save (Ctrl+S there).
+        """,
+        "top": """
+        top(1) - display and manage running processes
+        usage: top
+        Opens the System Monitor; select a process there and press q to quit it.
         """,
     ]
 }

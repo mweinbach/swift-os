@@ -14,6 +14,12 @@
 // only. Detected corruption (double free, wild pointer, broken tags) panics
 // with a literal message rather than silently poisoning the heap.
 //
+// Every public entry point (alloc/free/allocPages/freePages) is IRQ-atomic:
+// wrapped in armIrqSave/armIrqRestore (nesting-safe, unlike raw
+// enable/disable) so a timer IRQ can't context-switch into a second heap
+// user mid-operation — the preemptive scheduler makes the heap shared
+// between threads.
+//
 // Arena block format (16-byte aligned blocks, sizes are multiples of 16):
 //   +0        header: blockSize | flags (bit 0 = allocated)
 //   +8        allocated: back-pointer to block start (free() finds the block
@@ -127,6 +133,8 @@ enum KernelHeap {
     // MARK: - malloc
 
     static func alloc(size: Int, alignment: Int) -> UnsafeMutableRawPointer? {
+        let daif = armIrqSave()     // IRQ-atomic: see header comment
+        defer { armIrqRestore(daif) }
         var align = alignment
         if align < 16 { align = 16 }
         if align > 1_048_576 { return nil }     // absurd alignment: refuse (overflow guard)
@@ -193,6 +201,8 @@ enum KernelHeap {
     }
 
     static func free(_ p: UnsafeMutableRawPointer?) {
+        let daif = armIrqSave()     // IRQ-atomic: see header comment
+        defer { armIrqRestore(daif) }
         guard let p else { return }
         let payload = UInt(bitPattern: p)
         let b = loadPtr(payload - 8)             // back-pointer to block start
@@ -262,6 +272,8 @@ enum KernelHeap {
     // MARK: - Physical page allocator (4 KiB pages, first-fit contiguous)
 
     static func allocPages(_ count: Int) -> UInt? {
+        let daif = armIrqSave()     // IRQ-atomic: see header comment
+        defer { armIrqRestore(daif) }
         guard count > 0, count <= pageCount - firstAllocPage else { return nil }
         var i = firstAllocPage
         var run = 0
@@ -297,6 +309,8 @@ enum KernelHeap {
     }
 
     static func freePages(_ base: UInt, count: Int) {
+        let daif = armIrqSave()     // IRQ-atomic: see header comment
+        defer { armIrqRestore(daif) }
         guard count > 0 else { return }
         guard base >= heapStart, base < heapEnd else {
             kpanic("heap: freePages out of region")

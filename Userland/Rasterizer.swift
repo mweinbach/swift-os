@@ -38,6 +38,12 @@ public final class SoftwareSurface: Surface {
     /// pushClip calls beyond clipCapacity are counted so popClip stays balanced.
     private var clipOverflow = 0
 
+    /// Monotonic count of drawing primitives issued (clear/fill/stroke/line/
+    /// fillCircle/text). The compositor compares it against the count it
+    /// recorded after the last presented frame to detect that nothing drew
+    /// and skip the redraw + present entirely.
+    public private(set) var drawCalls: Int = 0
+
     public init(pixels: UnsafeMutableRawPointer, width: Int, height: Int, strideBytes: Int) {
         self.pixels = pixels
         self.pixelWidth = max(0, width)
@@ -107,14 +113,26 @@ public final class SoftwareSurface: Surface {
         let w = ax1 - ax0
         if brush.opaque {
             let v = brush.packed
+            let pair = UInt64(v) << 32 | UInt64(v)
             var y = ay0
             while y < ay1 {
-                var p = rowPtr(y) + ax0
+                let row = UnsafeMutableRawPointer(rowPtr(y) + ax0)
                 var n = w
-                while n > 0 {
-                    put(p, v)
-                    p += 1
+                var off = 0
+                // Head: one 32-bit store when the span starts mid-pair.
+                if UInt(bitPattern: row) & 4 != 0 {
+                    row.storeBytes(of: v, as: UInt32.self)
+                    off = 4
                     n -= 1
+                }
+                // Body: two pixels per 64-bit store.
+                while n >= 2 {
+                    row.storeBytes(of: pair, toByteOffset: off, as: UInt64.self)
+                    off += 8
+                    n -= 2
+                }
+                if n > 0 {
+                    row.storeBytes(of: v, toByteOffset: off, as: UInt32.self)
                 }
                 y += 1
             }
@@ -147,26 +165,39 @@ public final class SoftwareSurface: Surface {
     // MARK: - Surface primitives
 
     public override func clear(_ color: Color) {
+        drawCalls &+= 1
         let v = Brush(color).packed
+        let pair = UInt64(v) << 32 | UInt64(v)
         var y = 0
         while y < pixelHeight {
-            var p = rowPtr(y)
+            let row = UnsafeMutableRawPointer(rowPtr(y))
             var n = pixelWidth
-            while n > 0 {
-                put(p, v)
-                p += 1
+            var off = 0
+            if n > 0, UInt(bitPattern: row) & 4 != 0 {
+                row.storeBytes(of: v, as: UInt32.self)
+                off = 4
                 n -= 1
+            }
+            while n >= 2 {
+                row.storeBytes(of: pair, toByteOffset: off, as: UInt64.self)
+                off += 8
+                n -= 2
+            }
+            if n > 0 {
+                row.storeBytes(of: v, toByteOffset: off, as: UInt32.self)
             }
             y += 1
         }
     }
 
     public override func fill(_ rect: Rect, color: Color) {
+        drawCalls &+= 1
         guard color.a > 0, let b = pixelBounds(of: rect) else { return }
         spanFill(x0: b.x0, y0: b.y0, x1: b.x1, y1: b.y1, brush: Brush(color))
     }
 
     public override func stroke(_ rect: Rect, color: Color, width: CGFloat) {
+        drawCalls &+= 1
         guard width > 0, !rect.isEmpty, color.a > 0 else { return }
         let w = min(width, min(rect.width, rect.height) / 2)
         guard w > 0 else { return }
@@ -178,6 +209,7 @@ public final class SoftwareSurface: Surface {
     }
 
     public override func line(from p1: Point, to p2: Point, color: Color, width: CGFloat) {
+        drawCalls &+= 1
         guard width > 0, color.a > 0 else { return }
         // Endpoints beyond ±32768 px would make the walk below unreasonably
         // long; such lines are degenerate for a 1280x800 screen — skip them.
@@ -213,6 +245,7 @@ public final class SoftwareSurface: Surface {
     }
 
     public override func fillCircle(center: Point, radius: CGFloat, color: Color) {
+        drawCalls &+= 1
         guard radius > 0, usable(radius), color.a > 0,
               usable(center.x), usable(center.y) else { return }
         let brush = Brush(color)
@@ -255,6 +288,7 @@ public final class SoftwareSurface: Surface {
     }
 
     public override func text(_ string: String, at point: Point, color: Color, scale: CGFloat) {
+        drawCalls &+= 1
         guard !string.isEmpty, color.a > 0, usable(point.x), usable(point.y) else { return }
         let s = intScale(scale)
         let brush = Brush(color)
@@ -292,22 +326,37 @@ public final class SoftwareSurface: Surface {
     }
 
     /// Blit one glyph: cellWidth x cellHeight, 1 bit/pixel, MSB = leftmost.
-    /// Each set bit becomes an s x s block of the text color.
+    /// Per row the font byte is loaded once: 0x00 skips the row, 0xFF fills
+    /// it as one span, and anything in between is emitted as one span per
+    /// run of set bits. Each bit still becomes an s x s block, so the result
+    /// is pixel-identical to per-bit fills at every scale.
     private func blitGlyph(offset: Int, x: Int, y: Int, s: Int, brush: Brush) {
+        let cw = FontData.cellWidth
         var row = 0
         while row < FontData.cellHeight {
             let bits = FontData.bitmap[offset + row]
-            if bits != 0 {
+            let y0 = y + row * s
+            if bits == 0xFF, cw == 8 {
+                // Solid row: a single span instead of eight per-bit fills.
+                spanFill(x0: x, y0: y0, x1: x + cw * s, y1: y0 + s, brush: brush)
+            } else if bits != 0 {
                 var mask: UInt8 = 0x80
                 var col = 0
-                while col < FontData.cellWidth {
+                var runStart = -1
+                while col < cw {
                     if bits & mask != 0 {
-                        spanFill(x0: x + col * s, y0: y + row * s,
-                                 x1: x + (col + 1) * s, y1: y + (row + 1) * s,
-                                 brush: brush)
+                        if runStart < 0 { runStart = col }
+                    } else if runStart >= 0 {
+                        spanFill(x0: x + runStart * s, y0: y0,
+                                 x1: x + col * s, y1: y0 + s, brush: brush)
+                        runStart = -1
                     }
                     mask >>= 1
                     col += 1
+                }
+                if runStart >= 0 {
+                    spanFill(x0: x + runStart * s, y0: y0,
+                             x1: x + cw * s, y1: y0 + s, brush: brush)
                 }
             }
             row += 1

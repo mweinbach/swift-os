@@ -7,6 +7,9 @@
 //     the double-click threshold of 0.35s becomes 350ms)
 //   - UUID window ids -> a simple Int counter
 //   - WindowManager.tick no longer ticks the kernel (services tick themselves)
+// SwiftOS additions vs. the reference: global shortcuts (Ctrl+Alt+T opens a
+// terminal, Alt+F4 / Ctrl+Alt+W closes the focused window) and key capture for
+// the desktop's wallpaper context menu.
 
 // MARK: - OSApp (a windowed application)
 
@@ -311,7 +314,18 @@ final class WindowManager {
             } else {
                 _ = Desktop.shared.handle(event)
             }
-        case .keyDown, .keyUp:
+        case .keyDown(let key):
+            if handleGlobalShortcut(key) { return } // consumed: never reaches apps
+            if Desktop.shared.contextMenuActive {
+                _ = Desktop.shared.handle(event) // menu captures keys (Escape dismisses)
+                return
+            }
+            if let focused {
+                focused.app.handle(event)
+            } else {
+                _ = Desktop.shared.handle(event)
+            }
+        case .keyUp:
             if let focused {
                 focused.app.handle(event)
             } else {
@@ -323,6 +337,35 @@ final class WindowManager {
     private func p(for event: OSEvent) -> CGPoint {
         if case .rightMouseDown(let p) = event { return p }
         return .zero
+    }
+
+    // MARK: Global shortcuts
+
+    /// System-wide chords, handled before the focused app sees the event:
+    /// Ctrl+Alt+T opens a terminal; Alt+F4 — or Ctrl+Alt+W, since the virtio
+    /// input driver does not map F-keys — closes the focused window.
+    /// Returns true when the event was consumed.
+    private func handleGlobalShortcut(_ key: KeyEvent) -> Bool {
+        let ctrlAlt = key.modifiers.contains(.control) && key.modifiers.contains(.option)
+        // With Control held the input driver turns letters into control codes
+        // (ctrl+t = 0x14, ctrl+w = 0x17), so match keyCodes as well as "t"/"w".
+        if ctrlAlt && (key.characters == "t" || key.characters == "\u{14}" || key.keyCode == 17) {
+            if !key.isRepeat { // consume repeats too: one terminal per press
+                Desktop.shared.dismissMenus()
+                open(app: TerminalApp())
+            }
+            return true
+        }
+        let altF4 = key.modifiers.contains(.option) && key.keyCode == 118
+        let ctrlAltW = ctrlAlt && (key.characters == "w" || key.characters == "\u{17}" || key.keyCode == 13)
+        if altF4 || ctrlAltW {
+            if !key.isRepeat { // consume repeats too: one close per press
+                Desktop.shared.dismissMenus()
+                if let focused { close(focused) }
+            }
+            return true
+        }
+        return false
     }
 
     // MARK: Tick

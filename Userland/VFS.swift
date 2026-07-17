@@ -43,6 +43,9 @@ private final class FSNode {
     var children: [String: FSNode]  // directories only
     var modified: UInt64            // wall-clock ms
     let permissions: String
+    /// SwiftFS inode backing this node, or -1 when it is RAM-only (no disk,
+    /// or the never-persisted /var/log/syslog).
+    var inode: Int = -1
 
     init(name: String, isDirectory: Bool, contents: String = "",
          children: [String: FSNode] = [:], permissions: String) {
@@ -88,8 +91,18 @@ final class VFS {
     static let shared = VFS()
     private init() {}
 
-    /// Root of the tree, seeded lazily on first access.
-    private lazy var root: FSNode = VFS.seedTree()
+    /// Root of the tree. Lazily realized on first access: if a SwiftFS disk
+    /// is present it is mounted (or formatted + seeded) first — see `Disk` —
+    /// otherwise the tree comes from `seedTree()` exactly as before.
+    private var rootStorage: FSNode?
+    private var root: FSNode {
+        if let r = rootStorage { return r }
+        Disk.initAndMount()          // idempotent; may set rootStorage itself
+        if let r = rootStorage { return r }
+        let r = VFS.seedTree()
+        rootStorage = r
+        return r
+    }
 
     // MARK: Query
 
@@ -136,6 +149,7 @@ final class VFS {
             guard !existing.isDirectory else { throw VFSError.isDirectory(path: path) }
             existing.contents = contents
             existing.modified = Platform.services.wallClockMs
+            persistContents(of: existing, path: full)
             return
         }
         let base = VFS.basename(full)
@@ -144,7 +158,9 @@ final class VFS {
             throw VFSError.notFound(path: path)
         }
         guard parent.isDirectory else { throw VFSError.notDirectory(path: path) }
-        parent.children[base] = FSNode.file(base, contents)
+        let node = FSNode.file(base, contents)
+        parent.children[base] = node
+        persistNew(node: node, parent: parent, path: full)
     }
 
     // MARK: Mutation
@@ -159,7 +175,9 @@ final class VFS {
             throw VFSError.notFound(path: path)
         }
         guard parent.isDirectory else { throw VFSError.notDirectory(path: path) }
-        parent.children[base] = FSNode.dir(base)
+        let node = FSNode.dir(base)
+        parent.children[base] = node
+        persistNew(node: node, parent: parent, path: full)
     }
 
     /// Removes a file or an EMPTY directory. Throws notFound / directoryNotEmpty.
@@ -170,6 +188,7 @@ final class VFS {
         if target.isDirectory && !target.children.isEmpty {
             throw VFSError.directoryNotEmpty(path: path)
         }
+        persistRemove(target, path: full)
         resolve(VFS.dirname(full))?.children[VFS.basename(full)] = nil
     }
 
@@ -225,6 +244,127 @@ final class VFS {
               permissions: node.permissions)
     }
 
+    // MARK: - Persistence (SwiftFS write-through)
+
+    /// The one path that never touches the disk: the syslog is rendered live
+    /// from Platform.services.bootLog on every read.
+    private static let syslogPath = "/var/log/syslog"
+
+    /// Replaces the tree with the on-disk inode contents. Returns false when
+    /// the image holds nothing but the root inode (interrupted first format),
+    /// in which case the caller reseeds and persists instead.
+    @discardableResult
+    fileprivate func hydrateFromDisk() -> Bool {
+        let entries = SwiftFS.dumpInodes()
+        guard entries.count > 1 else { return false }
+        var nodes: [Int: FSNode] = [:]
+        for e in entries { nodes[e.index] = makeNode(e) }
+        for e in entries where e.index != 0 {
+            guard let child = nodes[e.index] else { continue }
+            // A dangling parent link should be impossible; re-home at root.
+            (nodes[e.parent] ?? nodes[0])?.children[child.name] = child
+        }
+        guard let newRoot = nodes[0], newRoot.isDirectory else { return false }
+        newRoot.name = "/"
+        rootStorage = newRoot
+        ensureSyslogNode()
+        klog("[vfs] hydrated \(entries.count - 1) entries from SwiftFS")
+        return true
+    }
+
+    /// Writes the entire current tree to a freshly formatted disk, assigning
+    /// an inode to every node (except the syslog, which stays RAM-only).
+    fileprivate func persistEntireTree() {
+        let r = root   // forces the seed tree when this is the first access
+        for child in r.children.values {
+            persistSubtree(child, parentInode: 0, path: "/" + child.name)
+        }
+    }
+
+    private func persistSubtree(_ node: FSNode, parentInode: Int, path: String) {
+        if path == VFS.syslogPath { return }
+        guard let idx = SwiftFS.create(name: node.name, parent: parentInode,
+                                       isDirectory: node.isDirectory,
+                                       executable: VFS.isExecutable(node),
+                                       mtime: node.modified) else {
+            klog("[vfs] persist failed for \(path)")
+            return
+        }
+        node.inode = idx
+        if node.isDirectory {
+            for child in node.children.values {
+                persistSubtree(child, parentInode: idx, path: path + "/" + child.name)
+            }
+        } else if !SwiftFS.writeFile(idx, Array(node.contents.utf8), mtime: node.modified) {
+            klog("[vfs] persist write failed for \(path)")
+        }
+    }
+
+    /// Write-through for a newly created node (file with contents, or dir).
+    private func persistNew(node: FSNode, parent: FSNode, path: String) {
+        guard Disk.mounted, parent.inode >= 0, path != VFS.syslogPath else { return }
+        guard let idx = SwiftFS.create(name: node.name, parent: parent.inode,
+                                       isDirectory: node.isDirectory,
+                                       executable: VFS.isExecutable(node),
+                                       mtime: node.modified) else {
+            klog("[vfs] persist create failed for \(path)")
+            return
+        }
+        node.inode = idx
+        if !node.isDirectory,
+           !SwiftFS.writeFile(idx, Array(node.contents.utf8), mtime: node.modified) {
+            klog("[vfs] persist write failed for \(path)")
+        }
+    }
+
+    /// Write-through for a contents update of an existing file.
+    private func persistContents(of node: FSNode, path: String) {
+        guard Disk.mounted, node.inode >= 0, path != VFS.syslogPath else { return }
+        if !SwiftFS.writeFile(node.inode, Array(node.contents.utf8), mtime: node.modified) {
+            klog("[vfs] persist write failed for \(path)")
+        }
+    }
+
+    /// Write-through for a removal (frees the inode and its data span).
+    private func persistRemove(_ node: FSNode, path: String) {
+        guard Disk.mounted, node.inode >= 0, path != VFS.syslogPath else { return }
+        if !SwiftFS.remove(node.inode) {
+            klog("[vfs] persist remove failed for \(path)")
+        }
+    }
+
+    private static func isExecutable(_ node: FSNode) -> Bool {
+        !node.isDirectory && node.permissions.contains("x")
+    }
+
+    private func makeNode(_ e: SFInode) -> FSNode {
+        let node: FSNode
+        if e.isDirectory {
+            node = FSNode(name: e.name, isDirectory: true, permissions: "drwxr-xr-x")
+        } else {
+            let bytes = SwiftFS.readFile(e.index) ?? []
+            node = FSNode(name: e.name, isDirectory: false,
+                          contents: String(decoding: bytes, as: UTF8.self),
+                          permissions: e.executable ? "-rwxr-xr-x" : "-rw-r--r--")
+        }
+        node.inode = e.index
+        node.modified = e.mtimeMs
+        return node
+    }
+
+    /// The hydrated tree must contain /var/log/syslog (RAM-only, inode -1) so
+    /// the path resolves for the live-boot-log hook in read().
+    private func ensureSyslogNode() {
+        guard let r = rootStorage else { return }
+        if r.children["var"] == nil { r.children["var"] = FSNode.dir("var") }
+        let varDir = r.children["var"]!
+        if varDir.children["log"] == nil { varDir.children["log"] = FSNode.dir("log") }
+        let logDir = varDir.children["log"]!
+        if logDir.children["syslog"] == nil {
+            logDir.children["syslog"] = FSNode.file("syslog", "")
+        }
+    }
+
     // MARK: Seed
 
     private static func seedTree() -> FSNode {
@@ -232,9 +372,10 @@ final class VFS {
             "swish", "sh", "bash", "ls", "cat", "echo", "pwd", "cd", "mkdir", "rm",
             "cp", "mv", "touch", "hostname", "uname", "date", "df", "ps", "grep",
             "head", "tail", "whoami", "env", "export", "history", "clear", "sudo",
-            "open", "help", "exit",
+            "open", "help", "exit", "kill",
         ]
-        let usrBinNames = ["find", "which", "man", "uptime", "free", "neofetch", "wc"]
+        let usrBinNames = ["find", "which", "man", "uptime", "free", "neofetch", "wc",
+                           "nano", "top"]
 
         let hostname = FSNode.file("hostname", "swiftos\n")
 
@@ -336,5 +477,53 @@ final class VFS {
                 FSNode.dir("log", children: [syslog]),
             ]),
         ])
+    }
+}
+
+
+// MARK: - Disk (boot-time storage integration)
+
+/// Persistent-storage orchestration: brings up the virtio-blk device, mounts
+/// the SwiftFS image if one exists, formats and seeds it if the disk is
+/// blank, and flips the VFS between hydrated, seeded-and-persisted, and
+/// RAM-only modes. Every failure is non-fatal — the system keeps running
+/// with the seeded in-memory tree exactly as before.
+///
+/// Idempotent. Intended to be called once from kmain during boot; the VFS
+/// also invokes it lazily on first access, so storage works either way.
+enum Disk {
+    /// True once a valid SwiftFS image is mounted and write-through is live.
+    static private(set) var mounted = false
+    private static var didInit = false
+
+    @discardableResult
+    static func initAndMount() -> Bool {
+        if didInit { return mounted }
+        didInit = true
+        guard BlockDev.initBlockDev() else {
+            klog("[disk] no block device — filesystem stays RAM-only")
+            return false
+        }
+        if SwiftFS.mount() {
+            mounted = true
+            if VFS.shared.hydrateFromDisk() {
+                klog("[disk] persistent storage online")
+            } else {
+                // Valid but empty image (e.g. power cut during the first
+                // seed): reseed in memory and write it through.
+                VFS.shared.persistEntireTree()
+                klog("[disk] empty image reseeded")
+            }
+        } else {
+            klog("[disk] no valid SwiftFS image — formatting")
+            guard SwiftFS.format() else {
+                klog("[disk] format FAILED — filesystem stays RAM-only")
+                return false
+            }
+            mounted = true
+            VFS.shared.persistEntireTree()
+            klog("[disk] fresh image formatted and seeded")
+        }
+        return true
     }
 }

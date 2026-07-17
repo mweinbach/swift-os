@@ -75,12 +75,22 @@ enum Interrupts {
 
     /// GIC dispatch for the Vectors.S IRQ stub (via swift_irq_dispatch).
     /// IRQ CONTEXT: no allocation, no interpolation — counters + MMIO only.
+    ///
+    /// The EOI comes BEFORE Scheduler.onTimerTick: the scheduler hook may
+    /// context-switch, and while the timer PPI is still active (not EOI'd)
+    /// the GIC will not re-signal it — deferring EOI until the preempted
+    /// thread resumes would starve the tick, and the scheduler itself is
+    /// driven by that tick. EOI first, then the (never-blocking) hook.
     fileprivate static func handleIrq(_ iar: UInt32) {
-        if (iar & 0x3FF) == timerIntid {
+        let intid = iar & 0x3FF
+        if intid == timerIntid {
             tickCount &+= 1
             armWriteCntpTval(ticksPerPeriod)    // next 10 ms tick
         }
         mmioWrite32(GIC.cEOIR, iar)
+        if intid == timerIntid {
+            Scheduler.onTimerTick()             // may context-switch; no-op unless Config.enableScheduler
+        }
     }
 
     /// Enable interrupt `id` in the distributor. PPIs are banked per-CPU;

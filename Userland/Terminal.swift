@@ -41,8 +41,8 @@ public final class TerminalApp: OSApp {
     private static let commandNames = [
         "cat", "cd", "clear", "cp", "date", "df", "echo", "env", "exit",
         "free", "grep", "head", "help", "history", "hostname", "kill", "ls",
-        "mkdir", "mv", "ps", "pwd", "rm", "rmdir", "tail", "touch", "uname",
-        "uptime", "whoami",
+        "mkdir", "mv", "nano", "ps", "pwd", "rm", "rmdir", "tail", "top",
+        "touch", "uname", "uptime", "whoami",
     ]
 
     // MARK: OSApp
@@ -211,12 +211,108 @@ public final class TerminalApp: OSApp {
         // Foundation's replacingOccurrences(of: "\r", with: "") inlined.
         var cleaned = ""
         for ch in output where ch != "\r" { cleaned.append(ch) }
-        var parts = cleaned.split(separator: "\n", omittingEmptySubsequences: false)
-            .map(String.init)
-        if parts.last == "" { parts.removeLast() } // trailing newline terminates, no extra blank
-        for part in parts {
-            appendLine([(text: part, color: .terminalText)])
+        for line in TerminalApp.parseSGR(cleaned) { appendLine(line) }
+    }
+
+    // MARK: ANSI SGR parsing (command output only — the prompt stays manual)
+
+    /// Palette for SGR 30-37 (black red green yellow blue magenta cyan white)
+    /// mapped onto the app colors. Bright codes (90-97) and bold (1) derive
+    /// from these via `brighten`.
+    private static let sgrPalette: [Color] = [
+        .darkGray, .red, .green, .yellow, .blue, .purple, .cyan, .lightGray,
+    ]
+
+    /// Bright variant of a color (SGR 1 / 90-97): mixed 45% toward white.
+    private static func brighten(_ color: Color) -> Color {
+        Color(color.r + (1 - color.r) * 0.45,
+              color.g + (1 - color.g) * 0.45,
+              color.b + (1 - color.b) * 0.45)
+    }
+
+    /// True for ASCII digits and ';' — written with scalar comparisons because
+    /// the kernel's unicode data stubs make `Character.isNumber` return true
+    /// for EVERY character (which let the CSI-param scan run to end-of-string).
+    private static func isCSIParamChar(_ c: Character) -> Bool {
+        guard let v = c.unicodeScalars.first, c.unicodeScalars.count == 1 else { return false }
+        return (v.value >= 48 && v.value <= 57) || v.value == 59 // '0'-'9' or ';'
+    }
+
+    /// Parses one command-output string into colored lines, understanding a
+    /// small subset of ANSI: SGR sequences ESC [ <params> m — 0 reset, 1
+    /// bright, 30-37 normal colors, 39 default foreground, 90-97 bright
+    /// colors — are stripped and mapped to run colors; color state carries
+    /// across lines of the same output. Other, malformed, or incomplete
+    /// escape sequences are dropped gracefully: output can never crash or
+    /// wedge the terminal.
+    private static func parseSGR(_ text: String) -> [Line] {
+        var lines: [Line] = []
+        var runs: [Run] = []
+        var pending = ""
+        var base: Color = .terminalText
+        var bright = false
+
+        func flushPending() {
+            guard !pending.isEmpty else { return }
+            runs.append((text: pending, color: bright ? brighten(base) : base))
+            pending = ""
         }
+        func flushLine() {
+            flushPending()
+            lines.append(runs)
+            runs = []
+        }
+        func applySGR(_ params: Substring) {
+            for field in params.split(separator: ";", omittingEmptySubsequences: false) {
+                let code = field.isEmpty ? 0 : (Int(field) ?? -1)
+                switch code {
+                case 0: base = .terminalText; bright = false
+                case 1: bright = true
+                case 30...37: base = sgrPalette[code - 30] // keeps the bright flag
+                case 39: base = .terminalText
+                case 90...97: base = brighten(sgrPalette[code - 90]); bright = false
+                default: break // unsupported SGR (underline etc.): ignore
+                }
+            }
+        }
+
+        var i = text.startIndex
+        while i < text.endIndex {
+            let c = text[i]
+            if c == "\n" {
+                flushLine()
+                i = text.index(after: i)
+                continue
+            }
+            if c != "\u{1B}" {
+                pending.append(c)
+                i = text.index(after: i)
+                continue
+            }
+            // Escape sequence: only CSI (ESC [ params <final>) is understood.
+            var j = text.index(after: i)
+            guard j < text.endIndex else { break } // trailing ESC: drop
+            guard text[j] == "[" else {
+                // Two-byte escape (ESC + one char): drop both, keep going.
+                i = text.index(after: j)
+                continue
+            }
+            j = text.index(after: j)
+            let paramsStart = j
+            while j < text.endIndex, TerminalApp.isCSIParamChar(text[j]) {
+                j = text.index(after: j)
+            }
+            guard j < text.endIndex else { break } // incomplete CSI: drop the rest
+            let params = text[paramsStart..<j]
+            let final = text[j]
+            i = text.index(after: j)
+            guard final == "m" else { continue } // other CSI (cursor moves): strip
+            flushPending()
+            applySGR(params)
+        }
+        flushPending()
+        if !runs.isEmpty { lines.append(runs) }
+        return lines
     }
 
     private func clearScrollback() {

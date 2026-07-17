@@ -4,8 +4,9 @@
 // involved: present() is a memcpy into the scanout buffer.
 //
 // Pixels are little-endian UInt32 0xFFRRGGBB (XR24 = DRM_FORMAT_XRGB8888).
-// The MMU is off, so Swift pointers are guest-physical addresses and RAM
-// buffers need no cache maintenance.
+// The MMU identity-maps RAM, so Swift pointers are guest-physical addresses;
+// under QEMU TCG, DMA is coherent with the caches, so the scanout buffer
+// needs no explicit cache maintenance (real hardware would — see MMU.swift).
 
 enum Display {
     static private(set) var width: Int = 0
@@ -107,10 +108,29 @@ enum Display {
         return true
     }
 
-    /// Copy the composited frame (back -> front).
+    /// Copy the composited frame (back -> front) as 16-byte chunks: a pair
+    /// of UInt64 loads then stores per iteration. Both buffers come from
+    /// allocPages (16-byte aligned) and strideBytes * height is a multiple
+    /// of 16 for our geometry, so the 32-bit tail is only a safety net for
+    /// other sizes.
     static func present() {
         if strideBytes == 0 { return }
-        _ = memcpy_(framebuffer, backBuffer, strideBytes * height)
+        let total = strideBytes * height
+        let dst = framebuffer
+        let src = backBuffer
+        var off = 0
+        while off + 16 <= total {
+            let lo = src.load(fromByteOffset: off, as: UInt64.self)
+            let hi = src.load(fromByteOffset: off + 8, as: UInt64.self)
+            dst.storeBytes(of: lo, toByteOffset: off, as: UInt64.self)
+            dst.storeBytes(of: hi, toByteOffset: off + 8, as: UInt64.self)
+            off += 16
+        }
+        while off < total {
+            let v = src.load(fromByteOffset: off, as: UInt32.self)
+            dst.storeBytes(of: v, toByteOffset: off, as: UInt32.self)
+            off += 4
+        }
     }
 
     // MARK: - fw_cfg DMA
@@ -169,8 +189,8 @@ enum Display {
 
     // Big-endian field stores, deliberately not inlinable: at -Osize the
     // compiler otherwise fuses runs of adjacent storeBytes into single
-    // 16-byte NEON stores, which alignment-fault on device memory (the MMU
-    // is off) unless the address happens to be 16-byte aligned.
+    // 16-byte NEON stores, which alignment-fault on the device memory the
+    // fw_cfg registers live in unless the address is 16-byte aligned.
     @inline(never)
     private static func storeBE32(_ p: UnsafeMutableRawPointer, _ off: Int, _ v: UInt32) {
         p.storeBytes(of: v.bigEndian, toByteOffset: off, as: UInt32.self)

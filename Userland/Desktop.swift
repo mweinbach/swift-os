@@ -44,6 +44,21 @@ final class Desktop {
         LauncherItem(id: .monitor, label: "System Monitor"),
     ]
 
+    // MARK: - Wallpaper context menu model
+
+    private enum ContextAction { case openTerminal, newFolder, about }
+
+    private struct ContextItem {
+        let label: String
+        let action: ContextAction
+    }
+
+    private static let contextItems: [ContextItem] = [
+        ContextItem(label: "Open Terminal", action: .openTerminal),
+        ContextItem(label: "New Folder", action: .newFolder),
+        ContextItem(label: "About SwiftOS", action: .about),
+    ]
+
     // MARK: - Interaction state
 
     /// A clickable piece of desktop chrome.
@@ -54,6 +69,7 @@ final class Desktop {
         case windowButton(ObjectIdentifier)
         case menuItem(Int)
         case icon(Int)
+        case contextMenuItem(Int)
     }
 
     private var selectedIcon: IconID?
@@ -61,6 +77,12 @@ final class Desktop {
     private var menuOpen = false
     private var hover: Target?
     private var pressTarget: Target?
+
+    // Wallpaper context menu + transient status line ("toast").
+    private var contextMenuOpen = false
+    private var contextMenuOrigin: CGPoint = .zero
+    private var statusText: String?
+    private var statusExpiry: TimeInterval = 0
 
     // MARK: - Clock
 
@@ -106,6 +128,24 @@ final class Desktop {
                       width: menu.width - 8, height: 30)
     }
 
+    /// Context menu anchored at the right-click point, clamped so it stays on
+    /// the usable screen (never overlapping the panel or taskbar).
+    private func contextMenuRect(size: CGSize) -> CGRect {
+        let width: CGFloat = 180
+        let height: CGFloat = 8 + CGFloat(Desktop.contextItems.count) * 28 + 8
+        let maxX = size.width - width - 4
+        let maxY = size.height - WindowManager.taskbarHeight - height - 4
+        return CGRect(x: min(max(contextMenuOrigin.x, 4), maxX),
+                      y: min(max(contextMenuOrigin.y, WindowManager.panelHeight + 2), maxY),
+                      width: width, height: height)
+    }
+
+    private func contextMenuItemRect(_ index: Int, size: CGSize) -> CGRect {
+        let menu = contextMenuRect(size: size)
+        return CGRect(x: menu.minX + 4, y: menu.minY + 8 + CGFloat(index) * 28,
+                      width: menu.width - 8, height: 28)
+    }
+
     // MARK: - Drawing entry points
 
     /// Full-screen draw: wallpaper + desktop icons, or the boot console while !bootFinished.
@@ -127,6 +167,8 @@ final class Desktop {
         drawPanel(surface, size: size)
         drawTaskbar(surface, size: size)
         if menuOpen { drawMenu(surface, size: size) }
+        if contextMenuOpen { drawContextMenu(surface, size: size) }
+        drawStatus(surface, size: size)
     }
 
     // MARK: - Boot sequence
@@ -458,6 +500,42 @@ final class Desktop {
         }
     }
 
+    // MARK: - Wallpaper context menu
+
+    private func drawContextMenu(_ surface: Surface, size: CGSize) {
+        let rect = contextMenuRect(size: size)
+        surface.fill(rect, color: .windowBackground)
+        surface.stroke(rect, color: .windowBorder, width: 1)
+        for (i, item) in Desktop.contextItems.enumerated() {
+            let itemRect = contextMenuItemRect(i, size: size)
+            if hover == .contextMenuItem(i) || pressTarget == .contextMenuItem(i) {
+                surface.fill(itemRect, color: .selection)
+            }
+            let ls = surface.textSize(item.label)
+            surface.text(item.label,
+                         at: CGPoint(x: itemRect.minX + 10, y: itemRect.midY - ls.height / 2),
+                         color: .panelText)
+        }
+    }
+
+    /// Transient status line shown above the taskbar for ~3s after a failed
+    /// context-menu action (e.g. mkdir error).
+    private func drawStatus(_ surface: Surface, size: CGSize) {
+        guard let text = statusText else { return }
+        if Platform.services.uptime >= statusExpiry {
+            statusText = nil
+            return
+        }
+        let ts = surface.textSize(text)
+        let rect = CGRect(x: (size.width - ts.width) / 2 - 12,
+                          y: size.height - WindowManager.taskbarHeight - ts.height - 30,
+                          width: ts.width + 24, height: ts.height + 12)
+        surface.fill(rect, color: .black.withAlpha(0.75))
+        surface.stroke(rect, color: .windowBorder, width: 1)
+        surface.text(text, at: CGPoint(x: rect.minX + 12, y: rect.minY + 6),
+                     color: .panelText)
+    }
+
     // MARK: - Bottom taskbar
 
     private func drawTaskbar(_ surface: Surface, size: CGSize) {
@@ -553,6 +631,15 @@ final class Desktop {
                 }
                 return true
             }
+            if contextMenuOpen {
+                if let t = target(at: p, size: size), case .contextMenuItem = t {
+                    pressTarget = t
+                } else {
+                    contextMenuOpen = false // click anywhere else dismisses (and is swallowed)
+                    pressTarget = .chrome
+                }
+                return true
+            }
             if let t = target(at: p, size: size) {
                 pressTarget = t
                 return true
@@ -563,7 +650,7 @@ final class Desktop {
             return false
         case .mouseUp(let p):
             guard let pressed = pressTarget else {
-                if menuOpen { return true }
+                if menuOpen || contextMenuOpen { return true }
                 return target(at: p, size: size) != nil
             }
             pressTarget = nil
@@ -579,10 +666,22 @@ final class Desktop {
                 if key.keyCode == 53 { menuOpen = false } // Escape
                 return true
             }
+            if contextMenuOpen {
+                if key.keyCode == 53 { contextMenuOpen = false } // Escape
+                return true
+            }
             return false
-        case .rightMouseDown:
+        case .rightMouseDown(let p):
             if menuOpen {
                 menuOpen = false
+                return true
+            }
+            if contextMenuOpen {
+                contextMenuOpen = false // right-click again dismisses
+                return true
+            }
+            if isEmptyWallpaper(at: p, size: size) {
+                openContextMenu(at: p)
                 return true
             }
             return false
@@ -593,6 +692,13 @@ final class Desktop {
 
     /// Hit-tests desktop chrome. Returns nil for window-covered or empty-wallpaper points.
     private func target(at p: CGPoint, size: CGSize) -> Target? {
+        if contextMenuOpen {
+            for i in Desktop.contextItems.indices where contextMenuItemRect(i, size: size).contains(p) {
+                return .contextMenuItem(i)
+            }
+            // Padding inside the menu is dead chrome (keeps hover off icons below).
+            if contextMenuRect(size: size).contains(p) { return .chrome }
+        }
         if menuOpen {
             for i in Desktop.items.indices where menuItemRect(i, size: size).contains(p) {
                 return .menuItem(i)
@@ -650,6 +756,17 @@ final class Desktop {
                 selectedIcon = item.id // single click selects
                 lastIconClick = (item.id, now)
             }
+        case .contextMenuItem(let i):
+            contextMenuOpen = false // menu closes after action
+            guard Desktop.contextItems.indices.contains(i) else { return }
+            switch Desktop.contextItems[i].action {
+            case .openTerminal:
+                WindowManager.shared.open(app: TerminalApp())
+            case .newFolder:
+                createFolder()
+            case .about:
+                WindowManager.shared.open(app: TextEditorApp(path: "/home/user/README.txt"))
+            }
         case .chrome:
             break
         }
@@ -668,6 +785,60 @@ final class Desktop {
         case .monitor:
             WindowManager.shared.open(app: SystemMonitorApp())
         }
+    }
+
+    // MARK: - Context menu support (used by WindowManager)
+
+    /// true while the wallpaper context menu is up; WindowManager routes
+    /// keyDown events to the desktop then, so Escape can dismiss the menu even
+    /// when a window is focused.
+    var contextMenuActive: Bool { contextMenuOpen }
+
+    /// Closes any open desktop menus. WindowManager calls this when a global
+    /// shortcut fires so menus never linger above a newly opened window.
+    func dismissMenus() {
+        menuOpen = false
+        contextMenuOpen = false
+    }
+
+    private func openContextMenu(at p: CGPoint) {
+        selectedIcon = nil
+        contextMenuOrigin = p
+        contextMenuOpen = true
+        hover = nil
+    }
+
+    /// True when `p` is on bare wallpaper: not the panel/taskbar, not an icon,
+    /// not over any window.
+    private func isEmptyWallpaper(at p: CGPoint, size: CGSize) -> Bool {
+        if p.y < WindowManager.panelHeight { return false }
+        if p.y >= size.height - WindowManager.taskbarHeight { return false }
+        if WindowManager.shared.hitTest(p) != nil { return false }
+        for i in Desktop.items.indices where iconSlot(i, size: size).contains(p) {
+            return false
+        }
+        return true
+    }
+
+    /// Creates "untitled folder" (auto-incremented) in /home/user; flashes a
+    /// status line on the desktop for ~3s if the mkdir fails.
+    private func createFolder() {
+        var name = "untitled folder"
+        var n = 2
+        while VFS.shared.exists("/home/user/" + name) {
+            name = "untitled folder \(n)"
+            n += 1
+        }
+        do {
+            try VFS.shared.mkdir("/home/user/" + name)
+        } catch let error {
+            flashStatus("mkdir: \(error.description)")
+        }
+    }
+
+    private func flashStatus(_ text: String) {
+        statusText = text
+        statusExpiry = Platform.services.uptime + 3
     }
 
     // MARK: - Tick

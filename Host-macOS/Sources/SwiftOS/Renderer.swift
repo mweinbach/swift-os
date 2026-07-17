@@ -413,9 +413,8 @@ private final class GlyphAtlas {
         ctx.clear(CGRect(x: 0, y: 0, width: width, height: height))
         ctx.setAllowsAntialiasing(true)
         ctx.setShouldAntialias(true)
-        // Flip so that memory row 0 is the visual top of the glyph.
-        ctx.translateBy(x: 0, y: CGFloat(height))
-        ctx.scaleBy(x: 1, y: -1)
+        // NOTE: CTFontDrawGlyphs already renders upright with memory row 0
+        // as the visual top — a CTM flip here double-flips every glyph.
         ctx.setFillColor(gray: 1, alpha: 1)
         var g = glyph
         var position = CGPoint(x: originX, y: originY)

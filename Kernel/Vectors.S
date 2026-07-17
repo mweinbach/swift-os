@@ -61,8 +61,12 @@ sync_exception_entry:
 
 // IRQ from EL1h. The interrupted context owns every register, so save all
 // caller-saved GPRs (x0-x18) and x30 around the Swift call, then eret.
+// SPSR_EL1/ELR_EL1 are saved in the frame too: with the preemptive
+// scheduler, the handler may context-switch, and the next IRQ (on another
+// thread) would otherwise overwrite them — the eventual eret must restore
+// THIS thread's exception context, not the latest one.
 irq_entry:
-    sub     sp, sp, #160
+    sub     sp, sp, #176
     stp     x0,  x1,  [sp, #0]
     stp     x2,  x3,  [sp, #16]
     stp     x4,  x5,  [sp, #32]
@@ -74,6 +78,9 @@ irq_entry:
     stp     x16, x17, [sp, #128]
     str     x18, [sp, #144]
     str     x30, [sp, #152]
+    mrs     x9, SPSR_EL1
+    mrs     x10, ELR_EL1
+    stp     x9, x10, [sp, #160]
 
     movz    x9, #0x0801, lsl #16            // GICC base 0x08010000
     ldr     w0, [x9, #0x0C]                 // GICC_IAR: acknowledge
@@ -82,6 +89,9 @@ irq_entry:
     b.eq    1f                              // spurious: no EOIR, just return
     bl      swift_irq_dispatch              // x0 = IAR: tick, reprogram, EOIR
 1:
+    ldp     x9, x10, [sp, #160]
+    msr     SPSR_EL1, x9
+    msr     ELR_EL1, x10
     ldp     x0,  x1,  [sp, #0]
     ldp     x2,  x3,  [sp, #16]
     ldp     x4,  x5,  [sp, #32]
@@ -93,7 +103,7 @@ irq_entry:
     ldp     x16, x17, [sp, #128]
     ldr     x18, [sp, #144]
     ldr     x30, [sp, #152]
-    add     sp, sp, #160
+    add     sp, sp, #176
     eret
 
 fiq_entry:

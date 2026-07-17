@@ -11,4 +11,11 @@ enum Config {
     /// Framebuffer geometry requested from ramfb.
     static let screenWidth = 1280
     static let screenHeight = 800
+
+    /// Preemptive round-robin kernel threads (Kernel/Scheduler.swift).
+    /// When false, Scheduler.initScheduler() is a no-op and the timer tick
+    /// never context-switches: the compositor loop runs alone, exactly as
+    /// before. Flip to true only together with calling
+    /// Scheduler.initScheduler() from kmain.
+    static let enableScheduler = true
 }

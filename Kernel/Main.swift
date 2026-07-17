@@ -32,6 +32,7 @@ public func kmain(dtb: UInt) -> Never {
     }
 
     Interrupts.initInterrupts()
+    Scheduler.initScheduler()
     let haveDisplay = Display.initDisplay()
     if !haveDisplay {
         klog("[boot] no ramfb device — continuing headless (serial only)")
@@ -56,6 +57,18 @@ public func kmain(dtb: UInt) -> Never {
                                   strideBytes: Display.strideBytes)
     var lastTimeMs = Clock.uptimeMs
 
+    // Frame-skip state: present only when something observable changed —
+    // input arrived, the cursor moved, or new drawing happened outside the
+    // loop (drawCalls is bumped by every SoftwareSurface primitive, so it
+    // only changes when drawFrame/drawCursor ran). A staleness cap forces a
+    // redraw at least every 500 ms because apps animate without any input
+    // (terminal cursor blink, panel clock, monitor graph).
+    var lastPresentedDraws = -1
+    var lastCursorX = -1
+    var lastCursorY = -1
+    var lastPresentMs: UInt64 = 0
+    let staleAfterMs: UInt64 = 500
+
     klog("[boot] login session started — compositor running")
 
     while true {
@@ -76,10 +89,19 @@ public func kmain(dtb: UInt) -> Never {
         WindowManager.shared.tick(dt)
 
         // --- frame ---------------------------------------------------------
-        WindowManager.shared.drawFrame(surface)
-        drawCursor(surface)
-        Display.present()
-        Tasks.noteRun(id: compositorID)
+        let cursorMoved = Input.mouseX != lastCursorX || Input.mouseY != lastCursorY
+        let stale = nowMs &- lastPresentMs >= staleAfterMs
+        if !events.isEmpty || cursorMoved || stale
+            || surface.drawCalls != lastPresentedDraws {
+            WindowManager.shared.drawFrame(surface)
+            drawCursor(surface)
+            Display.present()
+            lastPresentedDraws = surface.drawCalls
+            lastCursorX = Input.mouseX
+            lastCursorY = Input.mouseY
+            lastPresentMs = nowMs
+            Tasks.noteRun(id: compositorID)
+        }
 
         // --- pace ----------------------------------------------------------
         Interrupts.waitForNextTick()
