@@ -1,0 +1,6 @@
+SwiftOS kernel 1.0.0-aarch64 (Embedded Swift, bare metal)
+[boot] exception level EL1
+[boot] timer frequency 62500000 Hz
+[boot] heap 248 MB
+[boot] dtb at 0
+[boot] kernel up — waiting for subsystems
