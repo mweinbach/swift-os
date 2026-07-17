@@ -3,6 +3,8 @@
 // no Foundation/AppKit, OSApp is a base CLASS (see WindowManager port).
 // Immediate-mode: the model is a colored-run scrollback plus one editable
 // input line; `draw` renders the current state, `tick` drives the cursor blink.
+// Typing `top` switches the whole content area into a live htop-style process
+// view (TOP mode, see the section below) until 'q'/Ctrl+C returns to the prompt.
 
 public final class TerminalApp: OSApp {
     /// One colored text fragment within a line.
@@ -37,12 +39,27 @@ public final class TerminalApp: OSApp {
     private var wrappedScrollback: [[Run]]?
     private var wrappedColumns = -1
 
+    // MARK: TOP mode state
+
+    /// When true, the content area shows a live htop-style process view
+    /// instead of the scrollback + input line (entered by typing `top`).
+    private var topMode = false
+    /// Seconds between data refreshes in TOP mode (`top -d N` overrides).
+    private var topRefreshInterval: TimeInterval = TerminalApp.defaultTopRefresh
+    /// Time accumulated toward the next TOP-mode refresh.
+    private var topRefreshElapsed: TimeInterval = 0
+    /// Latest process snapshot, re-read from Platform.services at each refresh.
+    private var topProcesses: [ProcessInfo] = []
+    /// Default TOP-mode refresh cadence: ~4 Hz.
+    private static let defaultTopRefresh: TimeInterval = 0.25
+
     /// Commands offered for first-word Tab completion.
     private static let commandNames = [
         "cat", "cd", "clear", "cp", "date", "df", "echo", "env", "exit",
         "free", "grep", "head", "help", "history", "hostname", "kill", "ls",
-        "mkdir", "mv", "nano", "ps", "pwd", "rm", "rmdir", "tail", "top",
-        "touch", "uname", "uptime", "whoami",
+        "mkdir", "mv", "nano", "ping", "ps", "pwd", "reboot", "rm", "rmdir",
+        "shutdown", "tail", "top", "touch", "tree", "udemo", "uname", "uptime",
+        "whoami", "du",
     ]
 
     // MARK: OSApp
@@ -58,6 +75,14 @@ public final class TerminalApp: OSApp {
 
     public override func tick(_ dt: TimeInterval) {
         blinkTime += dt
+        // TOP mode: re-read the kernel's real task accounting on the refresh
+        // cadence; the compositor draws the snapshot on its next frame.
+        guard topMode else { return }
+        topRefreshElapsed += dt
+        if topRefreshElapsed >= topRefreshInterval {
+            topRefreshElapsed = 0
+            refreshTopProcesses()
+        }
     }
 
     // MARK: Draw
@@ -78,6 +103,14 @@ public final class TerminalApp: OSApp {
         let columns = max(1, Int(content.width / charWidth))
         let visibleRows = max(1, Int(content.height / lineHeight))
         lastVisibleRows = visibleRows
+
+        // TOP mode replaces the whole content area (no scrollback, no prompt).
+        if topMode {
+            drawTopMode(surface, content: content, charWidth: charWidth,
+                        lineHeight: lineHeight, columns: columns,
+                        visibleRows: visibleRows)
+            return
+        }
 
         // Rebuild the wrapped scrollback cache when stale.
         if wrappedColumns != columns {
@@ -337,6 +370,8 @@ public final class TerminalApp: OSApp {
         case .keyDown(let key):
             handleKey(key)
         case .scrollWheel(_, _, let deltaY):
+            // TOP mode has no scrollback: the wheel is ignored.
+            guard !topMode else { return }
             scrollPixelRemainder += deltaY
             let rows = Int(scrollPixelRemainder / lastLineHeight)
             if rows != 0 {
@@ -349,6 +384,13 @@ public final class TerminalApp: OSApp {
     }
 
     private func handleKey(_ key: KeyEvent) {
+        // TOP mode: scrollback input/history/completion are all suspended;
+        // only 'q' / Ctrl+C are meaningful (they leave TOP mode).
+        if topMode {
+            handleTopKey(key)
+            return
+        }
+
         let mods = key.modifiers
 
         if mods.contains(.command) {
@@ -444,6 +486,11 @@ public final class TerminalApp: OSApp {
             clearScrollback()
         } else if trimmed == "exit" {
             WindowManager.shared.closeApp(self)
+        } else if let refresh = TerminalApp.parseTopInvocation(trimmed) {
+            // Intercepted BEFORE the shell (like clear/exit): this shadows the
+            // shell's own `top` command — intended; the terminal's TOP mode is
+            // the interactive process viewer now.
+            enterTopMode(refreshInterval: refresh)
         } else if !trimmed.isEmpty {
             appendOutput(shell.execute(line))
         }
@@ -539,6 +586,219 @@ public final class TerminalApp: OSApp {
         input.replaceSubrange(start..<end, with: completion)
         cursorIndex = cursorIndex - wordLength + completion.count
         afterEdit()
+    }
+
+    // MARK: TOP mode (interactive fullscreen process view)
+
+    /// If `trimmed` is exactly `top` or `top -d <seconds>`, returns the TOP-mode
+    /// refresh interval in seconds (clamped to 0.1...60); any other line
+    /// returns nil and falls through to the shell.
+    private static func parseTopInvocation(_ trimmed: String) -> TimeInterval? {
+        let parts = trimmed.split(separator: " ", omittingEmptySubsequences: true)
+        guard parts.first == "top" else { return nil }
+        if parts.count == 1 { return defaultTopRefresh }
+        guard parts.count == 3, parts[1] == "-d",
+              let seconds = parseDecimal(parts[2]), seconds > 0 else { return nil }
+        return min(60, max(0.1, seconds))
+    }
+
+    /// Parses a positive decimal ("2", "0.5") with scalar-range checks —
+    /// `Character.isNumber` returns true for EVERY character on-device (the
+    /// unicode data stubs; see isCSIParamChar), so it can't be used here.
+    private static func parseDecimal(_ s: Substring) -> Double? {
+        var value = 0.0
+        var fracScale = 0.1
+        var seenDigit = false
+        var seenDot = false
+        for scalar in s.unicodeScalars {
+            if scalar.value == 46 { // '.'
+                if seenDot { return nil }
+                seenDot = true
+            } else if scalar.value >= 48, scalar.value <= 57 { // '0'-'9'
+                seenDigit = true
+                let digit = Double(scalar.value - 48)
+                if seenDot {
+                    value += digit * fracScale
+                    fracScale /= 10
+                } else {
+                    value = value * 10 + digit
+                }
+            } else {
+                return nil
+            }
+        }
+        return seenDigit ? value : nil
+    }
+
+    private func enterTopMode(refreshInterval: TimeInterval) {
+        topMode = true
+        topRefreshInterval = refreshInterval
+        topRefreshElapsed = 0
+        refreshTopProcesses() // the first TOP frame already has data
+    }
+
+    private func exitTopMode() {
+        topMode = false
+        topProcesses = []
+        scrollToBottom() // scrollback was never touched: prompt view restored
+        resetBlink()
+    }
+
+    /// Re-reads the real kernel task accounting, sorted htop-style by %CPU
+    /// descending (ties by PID ascending so the row order doesn't jitter).
+    private func refreshTopProcesses() {
+        topProcesses = Platform.services.processes.sorted {
+            $0.cpuPercent != $1.cpuPercent
+                ? $0.cpuPercent > $1.cpuPercent
+                : $0.pid < $1.pid
+        }
+    }
+
+    /// Keys in TOP mode: 'q' / Ctrl+C exits; everything else is ignored.
+    private func handleTopKey(_ key: KeyEvent) {
+        let mods = key.modifiers
+        if mods.contains(.control) {
+            if key.keyCode == 8 || key.characters == "\u{3}" { exitTopMode() } // Ctrl+C
+            return
+        }
+        if !mods.contains(.command),
+           key.characters == "q" || key.characters == "Q" {
+            exitTopMode()
+        }
+    }
+
+    /// htop-style load colors, same thresholds as System Monitor:
+    /// green < 5%, yellow < 15%, red above.
+    private static func topPercentColor(_ value: Double) -> Color {
+        if value < 5 { return .green }
+        if value < 15 { return .yellow }
+        return .red
+    }
+
+    /// The live htop-style view. The layout is recomputed from the content
+    /// rect (in character cells) on every frame, so resizing reflows it.
+    /// Rows: header, CPU summary, MEM bar, column header, process rows
+    /// (fitted to the remaining visible rows), optional footer hint.
+    private func drawTopMode(_ surface: Surface, content: CGRect,
+                             charWidth: CGFloat, lineHeight: CGFloat,
+                             columns: Int, visibleRows: Int) {
+        let services = Platform.services!
+
+        var rows: [[Run]] = []
+
+        // Header: hostname, ticking uptime, load average.
+        let (l1, l5, l15) = services.loadAverage
+        rows.append([
+            (text: services.hostname, color: .green),
+            (text: "  up ", color: .darkGray),
+            (text: TimeFmt.uptime(services.uptime), color: .terminalText),
+            (text: "   load average: ", color: .darkGray),
+            (text: NumFmt.f2(l1) + " " + NumFmt.f2(l5) + " " + NumFmt.f2(l15),
+             color: .green),
+        ])
+
+        // CPU summary: '#'/'-' block bar + total % + task counts.
+        let totalCPU = min(100, topProcesses.reduce(0) { $0 + $1.cpuPercent })
+        let running = topProcesses.filter { $0.state == "R" }.count
+        rows.append(topBarRow(label: "CPU",
+                              fraction: totalCPU / 100,
+                              fillColor: .green,
+                              text: NumFmt.f1(totalCPU) + "%",
+                              textColor: TerminalApp.topPercentColor(totalCPU),
+                              suffix: "  tasks " + String(topProcesses.count)
+                                  + ", running " + String(running),
+                              columns: columns))
+
+        // MEM bar: '#' used / '-' free, orange like System Monitor.
+        let usedMB = services.usedMemoryMB
+        let totalMB = services.totalMemoryMB
+        rows.append(topBarRow(label: "MEM",
+                              fraction: totalMB > 0 ? usedMB / totalMB : 0,
+                              fillColor: .orange,
+                              text: String(Int(usedMB)) + "/" + String(Int(totalMB)) + "MB",
+                              textColor: .terminalText,
+                              suffix: "",
+                              columns: columns))
+
+        // Column header: PID NAME %CPU MEM STAT (numeric fields right-aligned).
+        let pidW = 5, cpuW = 5, memW = 6, statW = 4
+        let nameW = max(4, columns - pidW - cpuW - memW - statW - 4)
+        rows.append([(text: NumFmt.right("PID", pidW) + " "
+                        + NumFmt.left("NAME", nameW) + " "
+                        + NumFmt.right("%CPU", cpuW) + " "
+                        + NumFmt.right("MEM", memW) + " "
+                        + NumFmt.left("STAT", statW),
+                      color: .gray)])
+
+        // Process rows, dense (one line each), fitted to the visible rows.
+        let hasFooter = visibleRows >= 8
+        let capacity = max(0, visibleRows - rows.count - (hasFooter ? 1 : 0))
+        for p in topProcesses.prefix(capacity) {
+            rows.append([
+                (text: NumFmt.right(String(p.pid), pidW), color: .gray),
+                (text: " " + NumFmt.left(p.name, nameW), color: .terminalText),
+                (text: " " + NumFmt.right(NumFmt.f1(p.cpuPercent), cpuW),
+                 color: TerminalApp.topPercentColor(p.cpuPercent)),
+                (text: " " + NumFmt.right(String(Int(p.memoryMB)), memW),
+                 color: .terminalText),
+                (text: " " + NumFmt.left(p.state, statW),
+                 color: p.state == "R" ? .green : .darkGray),
+            ])
+        }
+
+        // Draw top-down, truncating every row at the visible column count.
+        var y = content.minY
+        for row in rows {
+            var x = content.minX
+            for run in TerminalApp.truncateRuns(row, toWidth: columns) {
+                surface.text(run.text, at: CGPoint(x: x, y: y), color: run.color)
+                x += charWidth * CGFloat(run.text.count)
+            }
+            y += lineHeight
+        }
+
+        // Footer hint pinned to the bottom row when there is room.
+        if hasFooter {
+            surface.text("q quit   refresh " + NumFmt.f1(topRefreshInterval) + "s",
+                         at: CGPoint(x: content.minX, y: content.maxY - lineHeight),
+                         color: .darkGray)
+        }
+    }
+
+    /// One "LBL[###----] text suffix" bar row; the bar takes the column slack.
+    private func topBarRow(label: String, fraction: Double, fillColor: Color,
+                           text: String, textColor: Color,
+                           suffix: String, columns: Int) -> [Run] {
+        // Layout: LBL "[" bar "] " text suffix.
+        let barWidth = max(2, columns - label.count - 4 - text.count - suffix.count)
+        let clamped = min(1, max(0, fraction))
+        let filled = min(barWidth, Int(clamped * Double(barWidth) + 0.5))
+        return [
+            (text: label, color: .gray),
+            (text: "[", color: .darkGray),
+            (text: String(repeating: "#", count: filled), color: fillColor),
+            (text: String(repeating: "-", count: barWidth - filled), color: .darkGray),
+            (text: "] ", color: .darkGray),
+            (text: text, color: textColor),
+            (text: suffix, color: .darkGray),
+        ]
+    }
+
+    /// Truncates a run list to at most `columns` characters, preserving colors.
+    private static func truncateRuns(_ runs: [Run], toWidth columns: Int) -> [Run] {
+        var out: [Run] = []
+        var remaining = columns
+        for run in runs {
+            if remaining <= 0 { break }
+            if run.text.count <= remaining {
+                out.append(run)
+                remaining -= run.text.count
+            } else {
+                out.append((text: String(run.text.prefix(remaining)), color: run.color))
+                remaining = 0
+            }
+        }
+        return out
     }
 
     // MARK: String helpers (Foundation replacements)

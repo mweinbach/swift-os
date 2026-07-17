@@ -8,8 +8,10 @@
 //   - UUID window ids -> a simple Int counter
 //   - WindowManager.tick no longer ticks the kernel (services tick themselves)
 // SwiftOS additions vs. the reference: global shortcuts (Ctrl+Alt+T opens a
-// terminal, Alt+F4 / Ctrl+Alt+W closes the focused window) and key capture for
-// the desktop's wallpaper context menu.
+// terminal, Alt+F4 / Ctrl+Alt+W closes the focused window), key capture for
+// the desktop's wallpaper context menu, and Metacity-style Alt+drag window
+// management (Alt+drag moves from anywhere in a window, Alt+right-drag or
+// Alt+drag in the bottom-right quarter resizes).
 
 // MARK: - OSApp (a windowed application)
 
@@ -237,10 +239,22 @@ final class WindowManager {
     private var dragOffset: CGPoint = .zero
     private var dragStartFrame: CGRect = .zero
     private var dragStartPoint: CGPoint = .zero
+    /// Latest known keyboard modifier state. OSEvent mouse events carry no
+    /// modifiers, so this is tracked from keyDown/keyUp — the input driver
+    /// emits key events for the modifier keys themselves (see VirtioInput).
+    private var currentModifiers: KeyModifiers = []
     private var cascadeIndex = 0
     private var lastTitleClick: (window: Int, time: UInt64)?
 
     func handle(_ event: OSEvent) {
+        // Track modifier state from key events (mouse events carry none); the
+        // input driver emits keyDown/keyUp for the modifier keys themselves,
+        // with the post-change modifier set attached.
+        if case .keyDown(let key) = event {
+            currentModifiers = key.modifiers
+        } else if case .keyUp(let key) = event {
+            currentModifiers = key.modifiers
+        }
         guard Desktop.shared.bootFinished else {
             _ = Desktop.shared.handle(event)
             return
@@ -262,39 +276,41 @@ final class WindowManager {
                     return
                 }
                 lastTitleClick = (window.id, now)
-                dragMode = .move
-                dragWindow = window
-                dragOffset = CGPoint(x: p.x - window.frame.minX, y: p.y - window.frame.minY)
+                startMoveDrag(window, at: p)
             case .resize:
-                dragMode = .resize
-                dragWindow = window
-                dragStartFrame = window.frame
-                dragStartPoint = p
+                startResizeDrag(window, at: p)
             case .content:
-                window.app.handle(event)
+                if currentModifiers.contains(.option) {
+                    // Metacity-style Alt+drag: move from anywhere in the
+                    // content area; resize from the bottom-right quarter.
+                    // (The title-bar buttons above win even with Alt held.)
+                    if p.x >= window.frame.midX && p.y >= window.frame.midY {
+                        startResizeDrag(window, at: p)
+                    } else {
+                        startMoveDrag(window, at: p)
+                    }
+                } else {
+                    window.app.handle(event)
+                }
             }
-        case .rightMouseDown:
+        case .rightMouseDown(let p):
             if Desktop.shared.handle(event) { return }
-            if let (window, zone) = hitTest(p(for: event)), zone == .content {
+            // Metacity-style Alt+right-drag: resize from anywhere in the
+            // window (click-to-focus still happens first).
+            if currentModifiers.contains(.option) {
+                guard let (window, _) = hitTest(p) else { return }
+                focus(window)
+                startResizeDrag(window, at: p)
+                return
+            }
+            if let (window, zone) = hitTest(p), zone == .content {
                 focus(window)
                 window.app.handle(event)
             }
         case .mouseDragged(let p):
-            switch dragMode {
-            case .move:
-                if let window = dragWindow {
-                    var origin = CGPoint(x: p.x - dragOffset.x, y: p.y - dragOffset.y)
-                    origin.y = max(origin.y, WindowManager.panelHeight)
-                    window.frame.origin = origin
-                }
-            case .resize:
-                if let window = dragWindow {
-                    let newW = max(260, dragStartFrame.width + (p.x - dragStartPoint.x))
-                    let newH = max(170 + WindowManager.titleBarHeight,
-                                   dragStartFrame.height + (p.y - dragStartPoint.y))
-                    window.frame.size = CGSize(width: newW, height: newH)
-                }
-            case .none:
+            if dragMode != .none {
+                applyDrag(to: p)
+            } else {
                 focused?.app.handle(event)
             }
         case .mouseUp:
@@ -305,7 +321,13 @@ final class WindowManager {
             }
             if Desktop.shared.handle(event) { return }
             focused?.app.handle(event)
-        case .mouseMoved:
+        case .mouseMoved(let p):
+            // A drag whose button state got lost arrives as mouseMoved — keep
+            // driving the drag, and don't leak hover events to apps mid-drag.
+            if dragMode != .none {
+                applyDrag(to: p)
+                return
+            }
             _ = Desktop.shared.handle(event)
             focused?.app.handle(event)
         case .scrollWheel(let p, _, _):
@@ -334,9 +356,43 @@ final class WindowManager {
         }
     }
 
-    private func p(for event: OSEvent) -> CGPoint {
-        if case .rightMouseDown(let p) = event { return p }
-        return .zero
+    // MARK: Drag helpers (title-bar drags and Metacity-style Alt-drags)
+
+    /// Begin a title-bar-style move drag (also used by Alt+drag anywhere in
+    /// a window's content area).
+    private func startMoveDrag(_ window: OSWindow, at p: Point) {
+        dragMode = .move
+        dragWindow = window
+        dragOffset = CGPoint(x: p.x - window.frame.minX, y: p.y - window.frame.minY)
+    }
+
+    /// Begin a bottom-right resize drag (resize corner, Alt+right-drag, or
+    /// Alt+drag in the window's bottom-right quarter).
+    private func startResizeDrag(_ window: OSWindow, at p: Point) {
+        dragMode = .resize
+        dragWindow = window
+        dragStartFrame = window.frame
+        dragStartPoint = p
+    }
+
+    /// Apply the active drag (move/resize) to the current pointer position.
+    private func applyDrag(to p: Point) {
+        switch dragMode {
+        case .move:
+            if let window = dragWindow {
+                var origin = CGPoint(x: p.x - dragOffset.x, y: p.y - dragOffset.y)
+                origin.y = max(origin.y, WindowManager.panelHeight)
+                window.frame.origin = origin
+            }
+        case .resize:
+            if let window = dragWindow {
+                let newW = max(260, dragStartFrame.width + (p.x - dragStartPoint.x))
+                let newH = max(170 + WindowManager.titleBarHeight,
+                               dragStartFrame.height + (p.y - dragStartPoint.y))
+                window.frame.size = CGSize(width: newW, height: newH)
+            }
+        case .none: break
+        }
     }
 
     // MARK: Global shortcuts

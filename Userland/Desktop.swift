@@ -59,17 +59,34 @@ final class Desktop {
         ContextItem(label: "About SwiftOS", action: .about),
     ]
 
+    // MARK: - Panel power menu model
+
+    private enum PowerAction { case shutdown, restart, cancel }
+
+    private struct PowerItem {
+        let label: String
+        let action: PowerAction
+    }
+
+    private static let powerItems: [PowerItem] = [
+        PowerItem(label: "Shutdown", action: .shutdown),
+        PowerItem(label: "Restart", action: .restart),
+        PowerItem(label: "Cancel", action: .cancel),
+    ]
+
     // MARK: - Interaction state
 
     /// A clickable piece of desktop chrome.
     private enum Target: Equatable {
         case activities
+        case power
         case chrome // dead panel/taskbar area: consumed, no action
         case launcher(Int)
         case windowButton(ObjectIdentifier)
         case menuItem(Int)
         case icon(Int)
         case contextMenuItem(Int)
+        case powerMenuItem(Int)
     }
 
     private var selectedIcon: IconID?
@@ -84,6 +101,10 @@ final class Desktop {
     private var statusText: String?
     private var statusExpiry: TimeInterval = 0
 
+    // Panel power menu (Shutdown/Restart/Cancel) — never open together with
+    // the Activities or wallpaper context menus.
+    private var powerMenuOpen = false
+
     // MARK: - Clock
 
     private var clockString = ""
@@ -92,6 +113,7 @@ final class Desktop {
     // MARK: - Cached layout (measured with the Surface in drawOverlay, reused by hit-testing)
 
     private var cachedActivitiesRect: CGRect = .zero
+    private var cachedPowerRect: CGRect = .zero
     private var cachedWindowButtons: [(id: ObjectIdentifier, rect: CGRect)] = []
 
     // MARK: - Icon layout constants (8px padding rhythm)
@@ -146,6 +168,20 @@ final class Desktop {
                       width: menu.width - 8, height: 28)
     }
 
+    /// Power menu dropped straight below the panel's power glyph, flush right.
+    private func powerMenuRect(size: CGSize) -> CGRect {
+        let width: CGFloat = 150
+        let height: CGFloat = 8 + CGFloat(Desktop.powerItems.count) * 28 + 8
+        return CGRect(x: size.width - width - 8, y: WindowManager.panelHeight + 2,
+                      width: width, height: height)
+    }
+
+    private func powerMenuItemRect(_ index: Int, size: CGSize) -> CGRect {
+        let menu = powerMenuRect(size: size)
+        return CGRect(x: menu.minX + 4, y: menu.minY + 8 + CGFloat(index) * 28,
+                      width: menu.width - 8, height: 28)
+    }
+
     // MARK: - Drawing entry points
 
     /// Full-screen draw: wallpaper + desktop icons, or the boot console while !bootFinished.
@@ -168,6 +204,7 @@ final class Desktop {
         drawTaskbar(surface, size: size)
         if menuOpen { drawMenu(surface, size: size) }
         if contextMenuOpen { drawContextMenu(surface, size: size) }
+        if powerMenuOpen { drawPowerMenu(surface, size: size) }
         drawStatus(surface, size: size)
     }
 
@@ -420,9 +457,21 @@ final class Desktop {
         surface.text(label, at: CGPoint(x: actRect.minX + 14, y: (h - ls.height) / 2),
                      color: .panelText)
 
-        // Right cluster: [wifi] [battery] [clock].
+        // Right cluster: [wifi] [battery] [clock] [power].
+        let powerRect = CGRect(x: size.width - 30, y: 0, width: 30, height: h)
+        cachedPowerRect = powerRect
+        if powerMenuOpen {
+            surface.fill(powerRect, color: .selection)
+        } else if hover == .power {
+            surface.fill(powerRect, color: .white.withAlpha(0.08))
+        }
+        if pressTarget == .power {
+            surface.fill(powerRect, color: .black.withAlpha(0.25))
+        }
+        drawPowerGlyph(surface, center: CGPoint(x: powerRect.midX, y: h / 2))
+
         let clockSize = surface.textSize(clockString)
-        let clockX = size.width - 12 - clockSize.width
+        let clockX = powerRect.minX - 12 - clockSize.width
         surface.text(clockString, at: CGPoint(x: clockX, y: (h - clockSize.height) / 2),
                      color: .panelText)
         let batteryRect = CGRect(x: clockX - 14 - 22, y: (h - 11) / 2, width: 22, height: 11)
@@ -480,6 +529,34 @@ final class Desktop {
         }
     }
 
+    /// Classic power mark: an open ring with a vertical notch, built from line
+    /// segments through precomputed unit-circle points (no libm trig on this
+    /// target — same trick as drawWifi) plus one rect for the notch.
+    private func drawPowerGlyph(_ surface: Surface, center: CGPoint) {
+        let radius: CGFloat = 6.5
+        // (cos, sin) for 245° down to -55° in 30° steps: a 300° arc whose
+        // 60° gap sits at the top, where the notch enters.
+        let arc: [(Double, Double)] = [
+            (-0.4226, -0.9063), (-0.8192, -0.5736), (-0.9962, -0.0872),
+            (-0.9063, 0.4226), (-0.5736, 0.8192), (-0.0872, 0.9962),
+            (0.4226, 0.9063), (0.8192, 0.5736), (0.9962, 0.0872),
+            (0.9063, -0.4226), (0.5736, -0.8192),
+        ]
+        var previous: CGPoint?
+        for (c, s) in arc {
+            let point = CGPoint(x: center.x + CGFloat(c) * radius,
+                                y: center.y + CGFloat(s) * radius)
+            if let previous {
+                surface.line(from: previous, to: point, color: .panelText, width: 1.6)
+            }
+            previous = point
+        }
+        // Vertical notch: from just above the ring down to its center.
+        surface.fill(CGRect(x: center.x - 1.1, y: center.y - radius - 1.5,
+                            width: 2.2, height: radius + 1.5),
+                     color: .panelText)
+    }
+
     // MARK: - Activities menu
 
     private func drawMenu(_ surface: Surface, size: CGSize) {
@@ -509,6 +586,24 @@ final class Desktop {
         for (i, item) in Desktop.contextItems.enumerated() {
             let itemRect = contextMenuItemRect(i, size: size)
             if hover == .contextMenuItem(i) || pressTarget == .contextMenuItem(i) {
+                surface.fill(itemRect, color: .selection)
+            }
+            let ls = surface.textSize(item.label)
+            surface.text(item.label,
+                         at: CGPoint(x: itemRect.minX + 10, y: itemRect.midY - ls.height / 2),
+                         color: .panelText)
+        }
+    }
+
+    // MARK: - Panel power menu
+
+    private func drawPowerMenu(_ surface: Surface, size: CGSize) {
+        let rect = powerMenuRect(size: size)
+        surface.fill(rect, color: .windowBackground)
+        surface.stroke(rect, color: .windowBorder, width: 1)
+        for (i, item) in Desktop.powerItems.enumerated() {
+            let itemRect = powerMenuItemRect(i, size: size)
+            if hover == .powerMenuItem(i) || pressTarget == .powerMenuItem(i) {
                 surface.fill(itemRect, color: .selection)
             }
             let ls = surface.textSize(item.label)
@@ -640,6 +735,21 @@ final class Desktop {
                 }
                 return true
             }
+            if powerMenuOpen {
+                let t = target(at: p, size: size)
+                var keepMenu = false
+                if let t {
+                    if case .powerMenuItem = t { keepMenu = true }
+                    if case .power = t { keepMenu = true }
+                }
+                if keepMenu {
+                    pressTarget = t
+                } else {
+                    powerMenuOpen = false // click anywhere else dismisses (and is swallowed)
+                    pressTarget = .chrome
+                }
+                return true
+            }
             if let t = target(at: p, size: size) {
                 pressTarget = t
                 return true
@@ -650,7 +760,7 @@ final class Desktop {
             return false
         case .mouseUp(let p):
             guard let pressed = pressTarget else {
-                if menuOpen || contextMenuOpen { return true }
+                if menuOpen || contextMenuOpen || powerMenuOpen { return true }
                 return target(at: p, size: size) != nil
             }
             pressTarget = nil
@@ -670,6 +780,10 @@ final class Desktop {
                 if key.keyCode == 53 { contextMenuOpen = false } // Escape
                 return true
             }
+            if powerMenuOpen {
+                if key.keyCode == 53 { powerMenuOpen = false } // Escape
+                return true
+            }
             return false
         case .rightMouseDown(let p):
             if menuOpen {
@@ -678,6 +792,10 @@ final class Desktop {
             }
             if contextMenuOpen {
                 contextMenuOpen = false // right-click again dismisses
+                return true
+            }
+            if powerMenuOpen {
+                powerMenuOpen = false // right-click dismisses
                 return true
             }
             if isEmptyWallpaper(at: p, size: size) {
@@ -704,8 +822,17 @@ final class Desktop {
                 return .menuItem(i)
             }
         }
+        if powerMenuOpen {
+            for i in Desktop.powerItems.indices where powerMenuItemRect(i, size: size).contains(p) {
+                return .powerMenuItem(i)
+            }
+            // Padding inside the menu is dead chrome (keeps hover off windows below).
+            if powerMenuRect(size: size).contains(p) { return .chrome }
+        }
         if p.y < WindowManager.panelHeight {
-            return cachedActivitiesRect.contains(p) ? .activities : .chrome
+            if cachedActivitiesRect.contains(p) { return .activities }
+            if cachedPowerRect.contains(p) { return .power }
+            return .chrome
         }
         if p.y >= size.height - WindowManager.taskbarHeight {
             for i in Desktop.items.indices where launcherRect(i, size: size).contains(p) {
@@ -727,6 +854,13 @@ final class Desktop {
         switch target {
         case .activities:
             menuOpen.toggle()
+            powerMenuOpen = false
+        case .power:
+            powerMenuOpen.toggle()
+            if powerMenuOpen {
+                menuOpen = false
+                contextMenuOpen = false
+            }
         case .launcher(let i):
             guard Desktop.items.indices.contains(i) else { return }
             launch(Desktop.items[i].id)
@@ -767,6 +901,17 @@ final class Desktop {
             case .about:
                 WindowManager.shared.open(app: TextEditorApp(path: "/home/user/README.txt"))
             }
+        case .powerMenuItem(let i):
+            powerMenuOpen = false // menu closes after action
+            guard Desktop.powerItems.indices.contains(i) else { return }
+            switch Desktop.powerItems[i].action {
+            case .shutdown:
+                Power.shutdown()
+            case .restart:
+                Power.reboot()
+            case .cancel:
+                break
+            }
         case .chrome:
             break
         }
@@ -789,22 +934,25 @@ final class Desktop {
 
     // MARK: - Context menu support (used by WindowManager)
 
-    /// true while the wallpaper context menu is up; WindowManager routes
-    /// keyDown events to the desktop then, so Escape can dismiss the menu even
-    /// when a window is focused.
-    var contextMenuActive: Bool { contextMenuOpen }
+    /// true while a desktop menu that captures keys is up (wallpaper context
+    /// menu or panel power menu); WindowManager routes keyDown events to the
+    /// desktop then, so Escape can dismiss the menu even when a window is
+    /// focused.
+    var contextMenuActive: Bool { contextMenuOpen || powerMenuOpen }
 
     /// Closes any open desktop menus. WindowManager calls this when a global
     /// shortcut fires so menus never linger above a newly opened window.
     func dismissMenus() {
         menuOpen = false
         contextMenuOpen = false
+        powerMenuOpen = false
     }
 
     private func openContextMenu(at p: CGPoint) {
         selectedIcon = nil
         contextMenuOrigin = p
         contextMenuOpen = true
+        powerMenuOpen = false
         hover = nil
     }
 

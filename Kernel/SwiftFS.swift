@@ -22,7 +22,13 @@
 //                       +48 size u32
 //                       +52 firstBlock u32 (block index relative to dataStart)
 //                       +56 blockCount u32 (allocated span length, >= size)
-//                       +60 mtime u32  (wallClockMs truncated — spec-sanctioned)
+//                       +60 mtime u32  (SECONDS since 2024-01-01 00:00:00 UTC —
+//                                     ~136 years of range. The VFS converts
+//                                     to/from wall-clock ms at the boundary.
+//                                     Images written before this change hold
+//                                     truncated wall-clock ms here, so
+//                                     pre-existing files show odd dates until
+//                                     rewritten; magic deliberately unchanged.)
 //   bitmapStart ..    free bitmap, 1 bit per data block (1 = used)
 //   dataStart ..      data blocks, 8 sectors (4 KiB) each
 //
@@ -45,7 +51,7 @@ struct SFInode {
     let isDirectory: Bool
     let parent: Int
     let size: Int
-    let mtimeMs: UInt64      // zero-extended from the truncated u32
+    let mtimeSecs: UInt64   // seconds since 2024-01-01 UTC, zero-extended u32
     let executable: Bool
 }
 
@@ -202,7 +208,7 @@ enum SwiftFS {
                                    isDirectory: t == tDir,
                                    parent: Int(inodeTable[i * inodeSize + oParent]),
                                    size: Int(getU32(inodeTable, i * inodeSize + oSize)),
-                                   mtimeMs: UInt64(getU32(inodeTable, i * inodeSize + oMtime)),
+                                   mtimeSecs: UInt64(getU32(inodeTable, i * inodeSize + oMtime)),
                                    executable: getU16(inodeTable, i * inodeSize + oFlags) & 1 != 0))
             }
             i += 1
@@ -230,6 +236,8 @@ enum SwiftFS {
 
     /// Writes a file's full contents. Fits go into the existing span in
     /// place; growth allocates a new contiguous span and frees the old one.
+    /// `mtime` is seconds since 2024-01-01 UTC (the VFS converts wall-clock
+    /// ms at the boundary); it is stored truncated to u32 on disk.
     static func writeFile(_ index: Int, _ data: [UInt8], mtime: UInt64) -> Bool {
         guard isMounted, index > 0, index < inodeCount else { return false }
         let b = index * inodeSize
@@ -272,6 +280,7 @@ enum SwiftFS {
 
     /// Allocates and initializes an inode. Returns its index, or nil when the
     /// table is full or the name does not fit/encodes to nothing.
+    /// `mtime` is seconds since 2024-01-01 UTC (see writeFile).
     static func create(name: String, parent: Int, isDirectory: Bool,
                        executable: Bool, mtime: UInt64) -> Int? {
         guard isMounted, parent >= 0, parent < inodeCount else { return nil }
@@ -307,6 +316,26 @@ enum SwiftFS {
         if count > 0 { freeBlocks(first, count) }
         var i = 0
         while i < inodeSize { inodeTable[b + i] = 0; i += 1 }
+        return flushInode(index)
+    }
+
+    /// Renames and/or reparents a live inode: rewrites the 44-byte name field
+    /// and the parent link in place, then flushes the inode's sector. Data
+    /// blocks, size, flags and mtime are untouched (POSIX rename preserves
+    /// mtimes). The root (inode 0) can never be renamed. Names longer than
+    /// 44 bytes truncate at a scalar boundary, exactly like create(); an
+    /// empty name is rejected (every non-empty name encodes to >= 1 byte, so
+    /// this fully covers encodeName's failure mode before we clobber the old
+    /// name in the RAM cache).
+    static func rename(_ index: Int, name: String, parent: Int) -> Bool {
+        guard isMounted, index > 0, index < inodeCount,
+              parent >= 0, parent < inodeCount, !name.isEmpty else { return false }
+        let b = index * inodeSize
+        guard inodeTable[b + oType] != tFree else { return false }
+        var i = 0
+        while i < nameMax { inodeTable[b + oName + i] = 0; i += 1 }
+        guard encodeName(name, into: index) else { return false }
+        inodeTable[b + oParent] = UInt8(parent)
         return flushInode(index)
     }
 

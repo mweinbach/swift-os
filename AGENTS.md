@@ -19,7 +19,14 @@ frameworks at all (no Foundation/CoreGraphics/AppKit/Metal).
   legacy block device, synchronous polled 512B sector I/O), `SwiftFS.swift`
   (our own simple persistent filesystem on BlockDev: superblock + 256 inodes
   + block bitmap, 4 KiB contiguous spans, write-through), `Tasks.swift` (task
-  registry/CPU accounting), `KernelServices.swift` (the `Platform.services`
+  registry/CPU accounting), `Power.swift` + `PSCI.S` (PSCI 0.2 SYSTEM_OFF /
+  SYSTEM_RESET over `hvc #0` — QEMU virt has no EL3 by default, so the DTB
+  conduit is HVC, not SMC; QEMU exits 0 on shutdown, and on reset when
+  started with `-no-reboot`), `Userspace.swift` + `Userspace.S` (EL0 userspace:
+  runs an embedded unprivileged blob and services its `svc #0` ABI —
+  0=write(fd 1, captured) 1=uptime_ms 2=exit 3=yield; gated by
+  `Config.enableUserland`; lower-EL vector rows in `Vectors.S` route SVCs and
+  EL0-preempting IRQs), `KernelServices.swift` (the `Platform.services`
   seam), `Support.swift` (libc/runtime shims), `Config.swift`.
 - `Userland/` — software compiled into the same module: `Geometry.swift`
   (Point/Size/Rect/Color, `CGFloat=Double`, CGRect aliases), `Events.swift`,
@@ -31,8 +38,11 @@ frameworks at all (no Foundation/CoreGraphics/AppKit/Metal).
   WindowManager), `Desktop.swift`, `Terminal.swift`, `Shell.swift`, `VFS.swift`
   (in-memory Linux-like tree, typed throws; persists to SwiftFS when a disk
   is attached — `Disk.initAndMount()`, lazy on first VFS access),
-  `FileManagerApp.swift`, `TextEditorApp.swift`, `SystemMonitorApp.swift`.
+  `FileManagerApp.swift`, `TextEditorApp.swift`, `SystemMonitorApp.swift`,
+  `UserBlob.swift` (generated EL0 demo program bytes — see tools/mkblob.py).
 - `tools/genfont.swift` — macOS/CoreText generator that produces FontData.swift.
+- `tools/mkblob.py` — assembles `User/demo.S` (pure position-independent EL0
+  demo, `svc #0` ABI) and links it flat at address 0 into `Userland/UserBlob.swift`.
 - `tools/smoketest.py` — regression harness: builds, boots headless, asserts
   boot log, injects a shell battery, optional `--cocoa` screenshot pixel checks.
 - `Host-macOS/` — the earlier macOS SwiftPM harness (Metal/AppKit app showing
@@ -49,6 +59,7 @@ make run        # QEMU virt + ramfb + virtio input + virtio-blk disk + cocoa
 make serial     # headless, serial on stdio
 make disk       # create the 32MB build/disk.img (run/serial depend on it)
 make font       # regenerate Userland/FontData.swift (needs macOS CoreText)
+python3 tools/mkblob.py   # regenerate Userland/UserBlob.swift from User/demo.S
 make app        # build the Host-macOS harness
 python3 tools/smoketest.py [--cocoa]   # regression gate: boot + battery + pixels
 ```
@@ -129,6 +140,13 @@ splash eats keystrokes for ~12 s wall after "login session started".
 - The timer IRQ handler MUST save/restore SPSR_EL1/ELR_EL1 in its stack frame
   (Vectors.S) once context switches exist — otherwise a second IRQ on another
   thread erets to the wrong PC. This was a real bug; don't regress it.
+- The RAM gigabyte is mapped as an L2 table (512 x 2 MiB blocks), not a single
+  L1 block: `MMU.allowEL0` marks the slot holding the EL0 demo pages
+  EL0+EL1 RW + PXN. Don't fold it back into an L1 block — EL0 userspace
+  (Kernel/Userspace.swift) depends on per-slot AP bits. The lower-EL vector
+  rows in Vectors.S are live: sync_lower_entry's 176-byte frame contract with
+  swift_sync_lower (x0-x18, x30, SPSR, ELR) mirrors irq_entry — keep them in
+  sync.
 - The compositor skips present when nothing changed (SoftwareSurface.drawCalls
   + events + cursor position, 500ms staleness cap) — idle uses ~70x less CPU;
   interactive latency is one tick. Under QEMU TCG it still measures high CPU

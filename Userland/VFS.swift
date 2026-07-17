@@ -1,7 +1,9 @@
 // In-memory filesystem tree for SwiftOS userland (Embedded Swift port).
 // No Foundation: timestamps are UInt64 wall-clock milliseconds taken from
 // Platform.services.wallClockMs at seed/mutation time (format with
-// TimeFmt.fileDate). All throws are TYPED: throws(VFSError).
+// TimeFmt.fileDate). On disk, SwiftFS stores mtimes as u32 SECONDS since
+// 2024-01-01 UTC; the conversion happens here, at the SwiftFS boundary
+// (see toDiskSecs/fromDiskSecs). All throws are TYPED: throws(VFSError).
 
 /// A node in the in-memory filesystem tree, as exposed to the rest of the OS.
 struct VNode {
@@ -128,6 +130,14 @@ final class VFS {
 
     func isDirectory(_ path: String) -> Bool { resolve(path)?.isDirectory == true }
 
+    /// Total size in bytes of the tree at `path`: regular files count their
+    /// contents; directories recurse into their children (a directory's own
+    /// 4 KiB vnode size is not counted). Throws notFound. Backs `du`.
+    func sizeRecursive(_ path: String) throws(VFSError) -> Int {
+        guard let node = resolve(path) else { throw VFSError.notFound(path: path) }
+        return subtreeSize(node)
+    }
+
     // MARK: Contents
 
     /// Reads a regular file as UTF-8 text. Throws notFound / isDirectory.
@@ -192,6 +202,47 @@ final class VFS {
         resolve(VFS.dirname(full))?.children[VFS.basename(full)] = nil
     }
 
+    /// Renames or moves a file or directory — POSIX `mv` semantics:
+    /// an existing directory destination means "move inside it, keeping the
+    /// basename"; moving a directory into itself or a descendant is denied;
+    /// any other existing destination is an error (no clobbering). The moved
+    /// node keeps its mtime. Write-through to SwiftFS like other mutations.
+    /// Throws notFound / alreadyExists / isDirectory / notDirectory /
+    /// permissionDenied.
+    func rename(_ from: String, to: String) throws(VFSError) {
+        let src = VFS.normalize(from, cwd: "/")
+        guard src != "/" else { throw VFSError.permissionDenied(path: from) }
+        guard let node = resolve(src) else { throw VFSError.notFound(path: from) }
+
+        var dst = VFS.normalize(to, cwd: "/")
+        if let destDir = resolve(dst), destDir.isDirectory {
+            // POSIX mv: an existing directory destination means move inside it.
+            dst = VFS.normalize(VFS.basename(src), cwd: dst)
+        }
+        if dst == src { return } // same file: mv is a silent no-op
+        if let existing = resolve(dst) {
+            if node.isDirectory && !existing.isDirectory {
+                throw VFSError.notDirectory(path: to)   // dir onto a file
+            }
+            if !node.isDirectory && existing.isDirectory {
+                throw VFSError.isDirectory(path: to)    // file onto a dir
+            }
+            throw VFSError.alreadyExists(path: to)
+        }
+        let parentPath = VFS.dirname(dst)
+        if node.isDirectory && (parentPath == src || parentPath.hasPrefix(src + "/")) {
+            // Moving a directory into itself or one of its descendants.
+            throw VFSError.permissionDenied(path: to)
+        }
+        guard let parent = resolve(parentPath) else { throw VFSError.notFound(path: to) }
+        guard parent.isDirectory else { throw VFSError.notDirectory(path: to) }
+
+        resolve(VFS.dirname(src))?.children[VFS.basename(src)] = nil
+        node.name = VFS.basename(dst)
+        parent.children[node.name] = node
+        persistRename(node, parent: parent)
+    }
+
     // MARK: Path helpers (final implementations)
 
     /// Resolves `~`, relative paths (against `cwd`), `.` and `..` into a canonical
@@ -244,11 +295,34 @@ final class VFS {
               permissions: node.permissions)
     }
 
+    private func subtreeSize(_ node: FSNode) -> Int {
+        if !node.isDirectory { return node.contents.utf8.count }
+        var total = 0
+        for child in node.children.values { total += subtreeSize(child) }
+        return total
+    }
+
     // MARK: - Persistence (SwiftFS write-through)
 
     /// The one path that never touches the disk: the syslog is rendered live
     /// from Platform.services.bootLog on every read.
     private static let syslogPath = "/var/log/syslog"
+
+    /// SwiftFS stores mtimes as u32 seconds since 2024-01-01 00:00:00 UTC
+    /// (~136 years of range); the in-memory tree keeps wall-clock ms since
+    /// the Unix epoch. The conversion happens here, at the SwiftFS boundary.
+    /// Images written before this change hold truncated wall-clock ms in the
+    /// field, so pre-existing files show odd dates until they are rewritten
+    /// (superblock magic deliberately unchanged: SWFS0001).
+    private static let diskEpochMs: UInt64 = 1_704_067_200_000 // 2024-01-01T00:00:00Z
+
+    private static func toDiskSecs(_ wallMs: UInt64) -> UInt64 {
+        wallMs > diskEpochMs ? (wallMs - diskEpochMs) / 1000 : 0
+    }
+
+    private static func fromDiskSecs(_ secs: UInt64) -> UInt64 {
+        diskEpochMs + secs * 1000
+    }
 
     /// Replaces the tree with the on-disk inode contents. Returns false when
     /// the image holds nothing but the root inode (interrupted first format),
@@ -286,7 +360,7 @@ final class VFS {
         guard let idx = SwiftFS.create(name: node.name, parent: parentInode,
                                        isDirectory: node.isDirectory,
                                        executable: VFS.isExecutable(node),
-                                       mtime: node.modified) else {
+                                       mtime: VFS.toDiskSecs(node.modified)) else {
             klog("[vfs] persist failed for \(path)")
             return
         }
@@ -295,7 +369,7 @@ final class VFS {
             for child in node.children.values {
                 persistSubtree(child, parentInode: idx, path: path + "/" + child.name)
             }
-        } else if !SwiftFS.writeFile(idx, Array(node.contents.utf8), mtime: node.modified) {
+        } else if !SwiftFS.writeFile(idx, Array(node.contents.utf8), mtime: VFS.toDiskSecs(node.modified)) {
             klog("[vfs] persist write failed for \(path)")
         }
     }
@@ -306,13 +380,13 @@ final class VFS {
         guard let idx = SwiftFS.create(name: node.name, parent: parent.inode,
                                        isDirectory: node.isDirectory,
                                        executable: VFS.isExecutable(node),
-                                       mtime: node.modified) else {
+                                       mtime: VFS.toDiskSecs(node.modified)) else {
             klog("[vfs] persist create failed for \(path)")
             return
         }
         node.inode = idx
         if !node.isDirectory,
-           !SwiftFS.writeFile(idx, Array(node.contents.utf8), mtime: node.modified) {
+           !SwiftFS.writeFile(idx, Array(node.contents.utf8), mtime: VFS.toDiskSecs(node.modified)) {
             klog("[vfs] persist write failed for \(path)")
         }
     }
@@ -320,7 +394,7 @@ final class VFS {
     /// Write-through for a contents update of an existing file.
     private func persistContents(of node: FSNode, path: String) {
         guard Disk.mounted, node.inode >= 0, path != VFS.syslogPath else { return }
-        if !SwiftFS.writeFile(node.inode, Array(node.contents.utf8), mtime: node.modified) {
+        if !SwiftFS.writeFile(node.inode, Array(node.contents.utf8), mtime: VFS.toDiskSecs(node.modified)) {
             klog("[vfs] persist write failed for \(path)")
         }
     }
@@ -330,6 +404,16 @@ final class VFS {
         guard Disk.mounted, node.inode >= 0, path != VFS.syslogPath else { return }
         if !SwiftFS.remove(node.inode) {
             klog("[vfs] persist remove failed for \(path)")
+        }
+    }
+
+    /// Write-through for a rename/move: the inode's name and parent link are
+    /// rewritten in place (children of a moved directory keep pointing at its
+    /// unchanged inode, so nothing else needs persisting).
+    private func persistRename(_ node: FSNode, parent: FSNode) {
+        guard Disk.mounted, node.inode >= 0, parent.inode >= 0 else { return }
+        if !SwiftFS.rename(node.inode, name: node.name, parent: parent.inode) {
+            klog("[vfs] persist rename failed for \(node.name)")
         }
     }
 
@@ -348,7 +432,7 @@ final class VFS {
                           permissions: e.executable ? "-rwxr-xr-x" : "-rw-r--r--")
         }
         node.inode = e.index
-        node.modified = e.mtimeMs
+        node.modified = VFS.fromDiskSecs(e.mtimeSecs)
         return node
     }
 
@@ -372,10 +456,11 @@ final class VFS {
             "swish", "sh", "bash", "ls", "cat", "echo", "pwd", "cd", "mkdir", "rm",
             "cp", "mv", "touch", "hostname", "uname", "date", "df", "ps", "grep",
             "head", "tail", "whoami", "env", "export", "history", "clear", "sudo",
-            "open", "help", "exit", "kill",
+            "open", "help", "exit", "kill", "ping", "tree", "shutdown",
+            "poweroff", "reboot", "udemo",
         ]
         let usrBinNames = ["find", "which", "man", "uptime", "free", "neofetch", "wc",
-                           "nano", "top"]
+                           "nano", "top", "du"]
 
         let hostname = FSNode.file("hostname", "swiftos\n")
 

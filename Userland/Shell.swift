@@ -444,6 +444,12 @@ final class Shell {
         case "kill": return cmdKill(args)
         case "nano": return cmdNano(args)
         case "top": return cmdTop(args)
+        case "ping": return cmdPing(args)
+        case "tree": return cmdTree(args)
+        case "du": return cmdDU(args)
+        case "shutdown", "poweroff": return cmdShutdown()
+        case "reboot": return cmdReboot()
+        case "udemo": return cmdUDemo()
         case "sudo":
             return "user is not in the sudoers file. This incident will be reported."
         case "open": return cmdOpen(args)
@@ -930,6 +936,168 @@ final class Shell {
         return "System Monitor opened (q quits processes there)"
     }
 
+    /// `ping [-c N] <a.b.c.d>` — ICMP echo via the Net stack (Kernel/Net.swift).
+    /// Dotted-quad IPv4 only; QEMU slirp's gateway 10.0.2.2 always answers.
+    private func cmdPing(_ args: [String]) -> String {
+        var count = 3
+        var host: String? = nil
+        var i = 0
+        while i < args.count {
+            let arg = args[i]
+            if arg == "-c", i + 1 < args.count {
+                guard let n = Int(args[i + 1]), n > 0 else {
+                    return sgrError("ping: invalid count '\(args.count > i + 1 ? args[i + 1] : "")'")
+                }
+                count = n
+                i += 2
+            } else if arg.hasPrefix("-c"), let n = Int(arg.dropFirst(2)), n > 0 {
+                count = n
+                i += 1
+            } else if arg.hasPrefix("-"), arg.count > 1 {
+                return sgrError("ping: invalid option -- '\(arg.dropFirst().first ?? " ")'")
+            } else {
+                host = arg
+                i += 1
+            }
+        }
+        guard let h = host else { return sgrError("usage: ping [-c count] <a.b.c.d>") }
+        guard let ip = Shell.parseIPv4(h) else {
+            return sgrError("ping: cannot resolve \(h): Unknown host (dotted-quad IPv4 only)")
+        }
+        guard Net.ready else { return sgrError("ping: network unavailable (no virtio-net device)") }
+        return Net.ping(ip, count: count).joined(separator: "\n")
+    }
+
+    /// Strict dotted-quad parse ("10.0.2.2" → 0x0A000202). Digit tests are
+    /// scalar-range comparisons — the kernel's unicode stubs make
+    /// `Character.isNumber` return true for EVERY character (see AGENTS.md).
+    private static func parseIPv4(_ s: String) -> UInt32? {
+        var parts: [UInt32] = []
+        var value: UInt32 = 0
+        var digits = 0
+        for scalar in s.unicodeScalars {
+            if scalar.value == 46 {                 // '.'
+                guard digits > 0 else { return nil }
+                parts.append(value)
+                value = 0
+                digits = 0
+            } else if scalar.value >= 48, scalar.value <= 57 {
+                value = value * 10 + (scalar.value - 48)
+                digits += 1
+                guard digits <= 3, value <= 255 else { return nil }
+            } else {
+                return nil
+            }
+        }
+        guard digits > 0 else { return nil }
+        parts.append(value)
+        guard parts.count == 4 else { return nil }
+        return (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]
+    }
+
+    /// `tree [path]` — recursive pretty tree (├── └── │), dotfiles hidden
+    /// like ls/tree defaults. Box-drawing scalars render as replacement boxes
+    /// in the current 8x16 ASCII-only font; the text itself is correct.
+    private func cmdTree(_ args: [String]) -> String {
+        let target = args.first ?? "."
+        let full = VFS.normalize(target, cwd: cwd)
+        guard fs.exists(full) else { return sgrError("tree: \(target): No such file or directory") }
+        let display = target.hasSuffix("/") && target.count > 1 ? String(target.dropLast()) : target
+        guard fs.isDirectory(full) else { return display + "\n\n0 directories, 1 file" }
+        var lines: [String] = [display]
+        var dirCount = 0
+        var fileCount = 0
+        func walk(_ absolute: String, _ prefix: String) {
+            guard let children = try? fs.list(absolute) else { return }
+            let visible = children.filter { !$0.name.hasPrefix(".") }
+            for i in visible.indices {
+                let child = visible[i]
+                let last = i == visible.count - 1
+                lines.append(prefix + (last ? "└── " : "├── ") + child.name)
+                if child.isDirectory {
+                    dirCount += 1
+                    let childAbs = absolute == "/" ? "/" + child.name : absolute + "/" + child.name
+                    walk(childAbs, prefix + (last ? "    " : "│   "))
+                } else {
+                    fileCount += 1
+                }
+            }
+        }
+        walk(full, "")
+        let dirs = dirCount == 1 ? "1 directory" : "\(dirCount) directories"
+        let files = fileCount == 1 ? "1 file" : "\(fileCount) files"
+        lines.append("")
+        lines.append("\(dirs), \(files)")
+        return lines.joined(separator: "\n")
+    }
+
+    /// `du [-sh] [path]` — recursive size totals. Default unit is 512-byte
+    /// blocks (macOS du); -h prints human sizes via NumFmt.bytes; -s prints
+    /// only the grand total.
+    private func cmdDU(_ args: [String]) -> String {
+        var summary = false, human = false
+        var path: String? = nil
+        for arg in args {
+            if arg.hasPrefix("-"), arg.count > 1 {
+                for flag in arg.dropFirst() {
+                    switch flag {
+                    case "s": summary = true
+                    case "h": human = true
+                    default: return sgrError("du: invalid option -- '\(flag)'")
+                    }
+                }
+            } else if path == nil {
+                path = arg
+            }
+        }
+        let target = path ?? "."
+        let full = VFS.normalize(target, cwd: cwd)
+        guard fs.exists(full) else { return sgrError("du: \(target): No such file or directory") }
+        let display = target.hasSuffix("/") && target.count > 1 ? String(target.dropLast()) : target
+        func format(_ bytes: Int) -> String {
+            human ? NumFmt.bytes(bytes) : String((bytes + 511) / 512)
+        }
+        guard fs.isDirectory(full) else {
+            let size = (try? fs.node(at: full))?.size ?? 0
+            return format(size) + "\t" + display
+        }
+        var lines: [String] = []
+        func walk(_ absolute: String, _ disp: String) -> Int {
+            var total = 0
+            if let children = try? fs.list(absolute) {
+                for child in children {
+                    let childAbs = absolute == "/" ? "/" + child.name : absolute + "/" + child.name
+                    let childDisp = disp == "/" ? "/" + child.name : disp + "/" + child.name
+                    total += child.isDirectory ? walk(childAbs, childDisp) : child.size
+                }
+            }
+            if !summary { lines.append(format(total) + "\t" + disp) }
+            return total
+        }
+        let total = walk(full, display)
+        if summary { lines.append(format(total) + "\t" + display) }
+        return lines.joined(separator: "\n")
+    }
+
+    /// `shutdown` / `poweroff` — never returns. The message goes to the
+    /// serial console because the terminal only renders a command's output
+    /// after execute() returns, and this one doesn't.
+    private func cmdShutdown() -> String {
+        kprint("System going down\n")
+        Power.shutdown()
+    }
+
+    /// `reboot` — never returns (see cmdShutdown).
+    private func cmdReboot() -> String {
+        kprint("System going down\n")
+        Power.reboot()
+    }
+
+    /// `udemo` — run the EL0 user-process demo and print what it returns.
+    private func cmdUDemo() -> String {
+        UserProcess.runDemo()
+    }
+
     // MARK: - Recursive helpers
 
     private func copyTree(_ source: String, _ dest: String) throws(VFSError) {
@@ -1065,9 +1233,12 @@ final class Shell {
           grep <pat> [file]      print lines containing a substring
           wc [-l] [file]         count lines, words and bytes
           find [path]            list files recursively
+          tree [path]            print a directory tree
+          du [-sh] [path]        disk usage of files and directories
           uname [-a]             system information
           whoami                 print the current user
           hostname               print the system hostname
+          ping [-c N] <ip>       ping a dotted-quad IPv4 host
           ps [aux]               print the process table
           kill <pid>             close the app window owning a process
           top                    open the System Monitor (process viewer)
@@ -1084,6 +1255,9 @@ final class Shell {
           open <path>            open a file or folder in a GUI app
           nano <file>            edit a file in the Text Editor
           sudo <cmd>             attempt privilege escalation
+          udemo                  run the user-process (EL0) demo
+          shutdown, poweroff     power off the system
+          reboot                 restart the system
           clear                  clear the screen
           exit                   close the terminal
 
@@ -1204,6 +1378,42 @@ final class Shell {
         top(1) - display and manage running processes
         usage: top
         Opens the System Monitor; select a process there and press q to quit it.
+        """,
+        "ping": """
+        ping(8) - send ICMP ECHO_REQUEST packets to a network host
+        usage: ping [-c count] <a.b.c.d>
+        Dotted-quad IPv4 addresses only (there is no DNS). QEMU's gateway
+        10.0.2.2 always answers and is the usual demo target. Waits up to
+        one second per reply; -c sets the number of requests (default 3).
+        """,
+        "tree": """
+        tree(1) - list contents of directories in a tree-like format
+        usage: tree [path]
+        Prints a recursive listing with ├── └── │ connectors, then a
+        "N directories, M files" summary. Dotfiles are hidden (like ls).
+        """,
+        "du": """
+        du(1) - display disk usage statistics
+        usage: du [-s] [-h] [path]
+          -s  summarize: print only the grand total for the path
+          -h  human-readable sizes (4.2 KB) instead of 512-byte blocks
+        Without -s, every directory below the path gets its own line.
+        """,
+        "shutdown": """
+        shutdown(8) - power off the system
+        usage: shutdown   (alias: poweroff)
+        Prints "System going down" on the console and powers the machine off.
+        """,
+        "reboot": """
+        reboot(8) - restart the system
+        usage: reboot
+        Prints "System going down" on the console and reboots the machine.
+        """,
+        "udemo": """
+        udemo(1) - run the user-process demo
+        usage: udemo
+        Runs a small program in a real EL0 user process (see
+        Kernel/UserProcess.swift) and prints what it returns.
         """,
     ]
 }

@@ -1,6 +1,10 @@
 // Exception vector table, IRQ entry stub, and timer/vector sysreg helpers.
 // GICv2 on QEMU virt: GICD at 0x08000000, GICC at 0x08010000.
-// The kernel runs at EL1h, so only the "current EL, SPx" rows are used.
+// The kernel runs at EL1h, so EL1 exceptions use the "current EL, SPx" rows.
+// The "lower EL, AArch64" rows serve EL0 user code (Kernel/Userspace.swift):
+// SVC syscalls and user faults land in sync_lower_entry, timer IRQs that
+// preempt EL0 reuse irq_entry (its frame covers SPSR/ELR, so eret returns
+// to EL0 exactly as it returns to an interrupted EL1 thread).
 
 .section .text.vectors
 
@@ -29,15 +33,15 @@ exception_vectors:
 .balign 128
     b       serror_entry                    // SError
 
-// ---- Lower EL, AArch64 (no user processes yet) ----------------------------
+// ---- Lower EL, AArch64 (EL0 user code — see header) ------------------------
 .balign 128
-    b       vector_unexpected
+    b       sync_lower_entry                // synchronous (SVC / user fault)
 .balign 128
-    b       vector_unexpected
+    b       irq_entry                       // IRQ (preempting EL0)
 .balign 128
-    b       vector_unexpected
+    b       fiq_entry                       // FIQ (none exist — panics)
 .balign 128
-    b       vector_unexpected
+    b       serror_entry                    // SError (panics)
 
 // ---- Lower EL, AArch32 -----------------------------------------------------
 .balign 128
@@ -58,6 +62,70 @@ sync_exception_entry:
     bl      swift_sync_exception            // Never returns
 1:  wfi
     b       1b
+
+// Synchronous exception from EL0 (AArch64): SVC syscalls and user faults.
+// Saves the same 176-byte frame as irq_entry (x0-x18, x30, SPSR_EL1,
+// ELR_EL1 — layout documented at the swift_sync_lower call site in
+// Kernel/Userspace.swift), then:
+//   x0 = ESR_EL1, x1 = frame pointer, bl swift_sync_lower
+// Return 0: resume EL0 — write the frame back (the handler may have updated
+// the saved x0 return value; ELR already points past the svc on entry, so
+// no ELR fixup is needed) and eret.
+// Return != 0: the run is over (1 = exit syscall, 2 = user fault). Reload
+// the kernel SP that arm_run_el0 stashed in el0_kernel_save and jump into
+// its epilogue (el0_exited) with the marker in x0 — from the caller's
+// perspective arm_run_el0 simply returns. The abandoned sync frame sits
+// above the restored SP and is discarded.
+sync_lower_entry:
+    sub     sp, sp, #176
+    stp     x0,  x1,  [sp, #0]
+    stp     x2,  x3,  [sp, #16]
+    stp     x4,  x5,  [sp, #32]
+    stp     x6,  x7,  [sp, #48]
+    stp     x8,  x9,  [sp, #64]
+    stp     x10, x11, [sp, #80]
+    stp     x12, x13, [sp, #96]
+    stp     x14, x15, [sp, #112]
+    stp     x16, x17, [sp, #128]
+    str     x18, [sp, #144]
+    str     x30, [sp, #152]
+    mrs     x9, SPSR_EL1
+    mrs     x10, ELR_EL1
+    stp     x9, x10, [sp, #160]
+
+    mrs     x0, ESR_EL1
+    mov     x1, sp
+    bl      swift_sync_lower
+    cbnz    x0, 1f
+
+    // Resume EL0 (or panic-loop below if this was a kernel-side bug).
+    ldp     x9, x10, [sp, #160]
+    msr     SPSR_EL1, x9
+    msr     ELR_EL1, x10
+    ldp     x0,  x1,  [sp, #0]
+    ldp     x2,  x3,  [sp, #16]
+    ldp     x4,  x5,  [sp, #32]
+    ldp     x6,  x7,  [sp, #48]
+    ldp     x8,  x9,  [sp, #64]
+    ldp     x10, x11, [sp, #80]
+    ldp     x12, x13, [sp, #96]
+    ldp     x14, x15, [sp, #112]
+    ldp     x16, x17, [sp, #128]
+    ldr     x18, [sp, #144]
+    ldr     x30, [sp, #152]
+    add     sp, sp, #176
+    eret
+
+1:  // Teardown: x0 = marker (1 = exit, 2 = fault). Switch back to the
+    // stack arm_run_el0 was called on, restore the DAIF it saved (exception
+    // entry masked IRQs — without this the caller's thread would keep
+    // running with IRQs off and the timer tick would never fire again),
+    // and let arm_run_el0 return the marker.
+    adr     x9, el0_kernel_save
+    ldp     x10, x11, [x9]
+    mov     sp, x10
+    msr     daif, x11
+    b       el0_exited                    // in Kernel/Userspace.S
 
 // IRQ from EL1h. The interrupted context owns every register, so save all
 // caller-saved GPRs (x0-x18) and x30 around the Swift call, then eret.

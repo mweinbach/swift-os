@@ -10,10 +10,16 @@
 //   L1 (1 page, zeroed):
 //     L1[0]  = 1 GiB block [0x0000_0000, 0x4000_0000)
 //              device-nGnRnE (MAIR attr0), PXN — UART, GIC, virtio-mmio
-//     L1[1]  = 1 GiB block [0x4000_0000, 0x8000_0000)
-//              normal inner+outer write-back cacheable, inner shareable
-//              (MAIR attr1) — covers all 512 MiB of RAM plus kernel/heap
+//     L1[1]  -> L2 table (the RAM gigabyte, split so single 2 MiB slots can
+//              carry different AP/XP bits — the EL0 userspace window needs
+//              EL0-accessible pages; see allowEL0 below)
 //     rest   = invalid
+//   L2 (1 page, 512 entries):
+//     L2[i]  = 2 MiB block [0x4000_0000 + i*2MiB, +2MiB)
+//              normal inner+outer write-back cacheable, inner shareable
+//              (MAIR attr1) — covers all 512 MiB of RAM plus kernel/heap.
+//              Identical attrs to the former 1 GiB L1 block: same
+//              translation, one extra walk level.
 //
 // TCR.T0SZ = 24 (40-bit VA) — deliberately NOT 25: with a 4 KiB granule a
 // 39-bit VA (T0SZ=25) makes the hardware table walk START at level 1, so
@@ -72,9 +78,17 @@ enum MMU {
     private static let descBlock: UInt64 = 0b01       // valid block entry
     private static let descTable: UInt64 = 0b11       // valid table entry
     private static let attrIndx1: UInt64 = 1 << 2     // MAIR slot 1
+    private static let apEL0:     UInt64 = 1 << 6     // AP[1]: RW at EL0 too
     private static let shInner:   UInt64 = 3 << 8     // inner shareable
     private static let af:        UInt64 = 1 << 10    // access flag
-    private static let pxn:       UInt64 = 1 << 54    // never execute at EL1
+    private static let pxn:       UInt64 = 1 << 53    // never execute at EL1
+    private static let uxn:       UInt64 = 1 << 54    // never execute at EL0
+
+    /// L2 table covering the RAM gigabyte [0x4000_0000, 0x8000_0000), built
+    /// by initMMU. 0 when the MMU was never initialized (MMU off): allowEL0
+    /// is then a no-op — with translation disabled there are no permission
+    /// checks for EL0 to trip over anyway.
+    private static var l2RAM: UInt = 0
 
     /// Build the identity map and enable the MMU + I/D caches.
     /// On any sanity failure: log, leave the MMU off, return false.
@@ -91,20 +105,34 @@ enum MMU {
         }
 
         guard let l0 = KernelHeap.allocPages(1), let l1 = KernelHeap.allocPages(1),
-              l0 & 0xFFF == 0, l1 & 0xFFF == 0 else {
+              let l2 = KernelHeap.allocPages(1),
+              l0 & 0xFFF == 0, l1 & 0xFFF == 0, l2 & 0xFFF == 0 else {
             klog("[mmu] page table allocation failed, MMU stays off")
             return false
         }
         zeroPage(l0)
         zeroPage(l1)
+        zeroPage(l2)
 
         // L0[0] -> L1.
         putDesc(l0, 0, UInt64(l1) | descTable)
-        // L1[0]: [0x0000_0000, 0x4000_0000) device-nGnRnE (MAIR attr0), PXN.
-        putDesc(l1, 0, 0x0000_0000 | pxn | af | descBlock)
-        // L1[1]: [0x4000_0000, 0x8000_0000) normal WB (MAIR attr1), inner
-        // shareable — all 512 MiB of RAM [0x4000_0000, 0x6000_0000) included.
-        putDesc(l1, 1, 0x4000_0000 | af | shInner | attrIndx1 | descBlock)
+        // L1[0]: [0x0000_0000, 0x4000_0000) device-nGnRnE (MAIR attr0),
+        // execute-never at both ELs.
+        putDesc(l1, 0, 0x0000_0000 | pxn | uxn | af | descBlock)
+        // L2: 512 x 2 MiB blocks spanning [0x4000_0000, 0x8000_0000), normal
+        // WB (MAIR attr1), inner shareable, EL1-only RW — the same mapping
+        // the old 1 GiB L1 block produced, just split so allowEL0 can later
+        // relax single slots. All 512 MiB of RAM [0x4000_0000, 0x6000_0000)
+        // included.
+        var slot = 0
+        while slot < 512 {
+            let pa = UInt64(0x4000_0000) &+ (UInt64(slot) << 21)
+            putDesc(l2, slot, pa | af | shInner | attrIndx1 | descBlock)
+            slot &+= 1
+        }
+        // L1[1] -> L2 table.
+        putDesc(l1, 1, UInt64(l2) | descTable)
+        l2RAM = l2
 
         // Program the translation regime before enabling it.
         mmuWriteMAIR(mairValue)
@@ -129,6 +157,47 @@ enum MMU {
         }
         klog("[mmu] identity map on, caches enabled")
         return true
+    }
+
+    /// Open an EL0 window: mark every 2 MiB L2 slot covering
+    /// [base, base+byteCount) readable/writable at EL0 as well as EL1
+    /// (AP[1] set) and PXN (the kernel must never execute from a page EL0
+    /// can write). UXN stays clear so the slot can hold user code.
+    ///
+    /// Stage-1 granularity caveat (documented stage-2 = per-4 KiB user
+    /// maps): the WHOLE 2 MiB slot becomes EL0-accessible, including any
+    /// neighbouring heap pages allocPages hands out in it. The EL0 demo
+    /// blob is trusted demo code; do not run hostile binaries with this
+    /// mapping scheme.
+    ///
+    /// No-op when the MMU was never initialized (l2RAM == 0): with
+    /// translation off, EL0 accesses are unchecked anyway.
+    static func allowEL0(base: UInt, byteCount: UInt) {
+        guard l2RAM != 0, byteCount > 0 else { return }
+        let ramBase: UInt = 0x4000_0000
+        let ramEnd:  UInt = 0x8000_0000     // end of the mapped gigabyte
+        guard base >= ramBase, base < ramEnd, byteCount <= ramEnd - base else {
+            kpanic("mmu: allowEL0 range outside the RAM map")
+        }
+        let first = Int((base - ramBase) >> 21)
+        let last  = Int((base + byteCount - 1 - ramBase) >> 21)
+        var i = first
+        while i <= last {
+            let entry = l2RAM + UInt(i) * 8
+            let desc = UnsafeMutablePointer<UInt64>(bitPattern: entry)!
+            desc.pointee = desc.pointee | apEL0 | pxn
+            i &+= 1
+        }
+        // The window may already be cached in the TLB (heap pages get
+        // touched before the first EL0 run): flush and synchronize.
+        mmuTLBIAll()
+        armDsbSy()
+        armIsb()
+        kprint("[mmu] EL0 window: ")
+        kprintHex(UInt64(base))
+        kprint(" .. ")
+        kprintHex(UInt64(base + byteCount))
+        kprint(" (2 MiB-slot granularity)\n")
     }
 
     private static func zeroPage(_ base: UInt) {

@@ -18,4 +18,13 @@ enum Config {
     /// before. Flip to true only together with calling
     /// Scheduler.initScheduler() from kmain.
     static let enableScheduler = true
+
+    /// EL0 userspace: run the embedded demo blob unprivileged and service
+    /// its SVC syscalls (Kernel/Userspace.swift). When false,
+    /// UserProcess.runDemo() is a no-op returning "udemo: userspace
+    /// disabled". The supporting machinery (lower-EL vector rows, the MMU
+    /// L2 split) is inert while the gate is off: nothing ever drops to EL0,
+    /// so those vectors never fire, and the L2 split is byte-for-byte the
+    /// same translation as the old 1 GiB RAM block.
+    static let enableUserland = true
 }

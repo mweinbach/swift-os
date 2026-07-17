@@ -38,6 +38,7 @@ public func kmain(dtb: UInt) -> Never {
         klog("[boot] no ramfb device — continuing headless (serial only)")
     }
     _ = Input.initInput()
+    _ = Net.initNet()
 
     let compositorID = Tasks.register(name: "swiftcomp", memoryMB: 32)
     let inputID = Tasks.register(name: "inputd", memoryMB: 4)
@@ -72,6 +73,7 @@ public func kmain(dtb: UInt) -> Never {
     klog("[boot] login session started — compositor running")
 
     while true {
+        Net.poll()
         // --- input -------------------------------------------------------
         let events = Input.pollEvents()
         if !events.isEmpty {

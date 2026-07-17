@@ -20,6 +20,7 @@ QEMUFLAGS := -M virt -cpu cortex-a72 -m 512M \
              -device virtio-tablet-device \
              -device virtio-blk-device,drive=hd0 \
              -drive file=build/disk.img,format=raw,if=none,id=hd0 \
+             -netdev user,id=n0 -device virtio-net-device,netdev=n0 \
              -global virtio-mmio.force-legacy=on
 
 .PHONY: all run serial font app disk clean
