@@ -446,6 +446,10 @@ final class Shell {
         case "nano": return cmdNano(args)
         case "top": return cmdTop(args)
         case "ping": return cmdPing(args)
+        case "nslookup": return cmdNSLookup(args)
+        case "host": return cmdHost(args)
+        case "urun": return cmdURun()
+        case "ukill": return cmdUKill(args)
         case "tree": return cmdTree(args)
         case "du": return cmdDU(args)
         case "shutdown", "poweroff": return cmdShutdown()
@@ -968,8 +972,11 @@ final class Shell {
         return "System Monitor opened (q quits processes there)"
     }
 
-    /// `ping [-c N] <a.b.c.d>` — ICMP echo via the Net stack (Kernel/Net.swift).
-    /// Dotted-quad IPv4 only; QEMU slirp's gateway 10.0.2.2 always answers.
+    /// `ping [-c N] <host>` — ICMP echo via the Net stack (Kernel/Net.swift).
+    /// The target may be a dotted-quad IPv4 address or a hostname, which is
+    /// resolved through DNS (slirp's 10.0.2.3) first — the resolve line is
+    /// printed, then the normal ping output follows (slirp does not route
+    /// past itself, so resolved public hosts truthfully time out).
     private func cmdPing(_ args: [String]) -> String {
         var count = 3
         var host: String? = nil
@@ -992,12 +999,59 @@ final class Shell {
                 i += 1
             }
         }
-        guard let h = host else { return sgrError("usage: ping [-c count] <a.b.c.d>") }
-        guard let ip = Shell.parseIPv4(h) else {
-            return sgrError("ping: cannot resolve \(h): Unknown host (dotted-quad IPv4 only)")
-        }
+        guard let h = host else { return sgrError("usage: ping [-c count] <host>") }
         guard Net.ready else { return sgrError("ping: network unavailable (no virtio-net device)") }
-        return Net.ping(ip, count: count).joined(separator: "\n")
+        var lines: [String] = []
+        let ip: UInt32
+        if let dotted = Shell.parseIPv4(h) {
+            ip = dotted
+        } else {
+            guard let resolved = Net.dnsResolveIPv4(h) else {
+                return sgrError("ping: cannot resolve \(h): Unknown host")
+            }
+            // Same line shape dnsResolve prints on success.
+            lines.append("\(h) has address \(Net.dotted(resolved))")
+            ip = resolved
+        }
+        lines.append(contentsOf: Net.ping(ip, count: count))
+        return lines.joined(separator: "\n")
+    }
+
+    /// `nslookup <name>` — DNS A-record lookup via slirp's resolver.
+    private func cmdNSLookup(_ args: [String]) -> String {
+        guard let name = args.first, !name.hasPrefix("-") else {
+            return sgrError("usage: nslookup <name>")
+        }
+        guard Net.ready else { return sgrError("nslookup: network unavailable") }
+        return Net.dnsResolve(name)
+    }
+
+    /// `host <name>` — same lookup as nslookup, same output line.
+    private func cmdHost(_ args: [String]) -> String {
+        guard let name = args.first, !name.hasPrefix("-") else {
+            return sgrError("usage: host <name>")
+        }
+        guard Net.ready else { return sgrError("host: network unavailable") }
+        return Net.dnsResolve(name)
+    }
+
+    /// `urun` — spawn the EL0 user demo blob as a background user process
+    /// (UserProcess.spawn is provided by the EL0 userspace agent).
+    private func cmdURun() -> String {
+        let pid = UserProcess.spawn(blob: UserBlob.bytes)
+        guard pid >= 0 else { return sgrError("urun: could not start user process") }
+        return "started user process \(pid)"
+    }
+
+    /// `ukill <pid>` — terminate a user process started by urun.
+    private func cmdUKill(_ args: [String]) -> String {
+        guard let arg = args.first, let pid = Int(arg) else {
+            return sgrError("usage: ukill <pid>")
+        }
+        guard UserProcess.kill(pid: pid) else {
+            return sgrError("ukill: \(pid): No such user process")
+        }
+        return "killed \(pid)"
     }
 
     /// Strict dotted-quad parse ("10.0.2.2" → 0x0A000202). Digit tests are
@@ -1270,7 +1324,9 @@ final class Shell {
           uname [-a]             system information
           whoami                 print the current user
           hostname               print the system hostname
-          ping [-c N] <ip>       ping a dotted-quad IPv4 host
+          ping [-c N] <host>     ping an IPv4 address or hostname (via DNS)
+          nslookup <name>        resolve a hostname to its IPv4 address
+          host <name>            resolve a hostname (same as nslookup)
           ps [aux]               print the process table
           kill <pid>             close an app window or stop a kernel thread
           smpdemo [n]            spawn n CPU-bound demo threads (default 3, max 8)
@@ -1289,6 +1345,8 @@ final class Shell {
           nano <file>            edit a file in the Text Editor
           sudo <cmd>             attempt privilege escalation
           udemo                  run the user-process (EL0) demo
+          urun                   spawn the EL0 demo as a user process
+          ukill <pid>            kill a user process started by urun
           shutdown, poweroff     power off the system
           reboot                 restart the system
           clear                  clear the screen
@@ -1422,10 +1480,25 @@ final class Shell {
         """,
         "ping": """
         ping(8) - send ICMP ECHO_REQUEST packets to a network host
-        usage: ping [-c count] <a.b.c.d>
-        Dotted-quad IPv4 addresses only (there is no DNS). QEMU's gateway
-        10.0.2.2 always answers and is the usual demo target. Waits up to
-        one second per reply; -c sets the number of requests (default 3).
+        usage: ping [-c count] <host>
+        The host may be a dotted-quad IPv4 address or a hostname, resolved
+        through DNS (QEMU slirp's resolver at 10.0.2.3). The gateway
+        10.0.2.2 always answers and is the usual demo target; slirp does not
+        route beyond itself, so resolved public names truthfully time out.
+        Waits up to one second per reply; -c sets the count (default 3).
+        """,
+        "nslookup": """
+        nslookup(1) - query DNS for a host's IPv4 address
+        usage: nslookup <name>
+        Sends a recursive A-record query to QEMU slirp's DNS forwarder
+        (10.0.2.3) and prints "<name> has address a.b.c.d". Waits up to
+        about two seconds for the answer. See also: host(1).
+        """,
+        "host": """
+        host(1) - DNS lookup utility
+        usage: host <name>
+        Resolves a hostname to its IPv4 address via DNS, printing
+        "<name> has address a.b.c.d". Same resolver as nslookup(1).
         """,
         "tree": """
         tree(1) - list contents of directories in a tree-like format
@@ -1455,6 +1528,17 @@ final class Shell {
         usage: udemo
         Runs a small program in a real EL0 user process (see
         Kernel/UserProcess.swift) and prints what it returns.
+        """,
+        "urun": """
+        urun(1) - spawn the EL0 user demo program
+        usage: urun
+        Starts the embedded user blob (UserBlob) as a real EL0 user process
+        and prints "started user process <pid>". See also: ukill(1), udemo(1).
+        """,
+        "ukill": """
+        ukill(1) - kill a user process
+        usage: ukill <pid>
+        Terminates a user process started by urun (see `ps` for PIDs).
         """,
     ]
 }

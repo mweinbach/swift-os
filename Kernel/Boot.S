@@ -1,10 +1,20 @@
 // SwiftOS kernel entry point and low-level ARM helpers.
-// QEMU virt boots -kernel images at 0x40080000 with x0 = DTB pointer, in EL2 or EL1.
+//
+// QEMU virt boots -kernel images at the link address (0x4020_0000, see
+// link.ld), in EL2 or EL1. The DTB handover depends on the image type
+// (QEMU hw/arm/boot.c): raw Linux-protocol images get the DTB address in
+// x0 from QEMU's bootloader stub; ELF images like ours take the bare-metal
+// path — the CPU jumps straight to _start with x0 = 0 and QEMU ROM-loads
+// its generated FDT (always padded to 1 MiB) at the RAM base 0x4000_0000,
+// but ONLY if it fits below the kernel image (that is why link.ld moved
+// the kernel from 0x4008_0000 to 0x4020_0000: the old 512 KiB gap silently
+// dropped the 1 MiB FDT). Machine.discover (Kernel/DTB.swift) probes the
+// RAM base when x0 arrives as 0.
 
 .section .text.boot
 .globl _start
 _start:
-    mov     x20, x0                 // preserve DTB pointer
+    mov     x20, x0                 // preserve DTB pointer (0 on ELF boots)
 
     mrs     x9, CurrentEL
     lsr     x9, x9, #2

@@ -13,6 +13,12 @@ enum Config {
     static let screenHeight = 800
 
     /// Machine profile (QEMU Pi 5 match: cortex-a76, 4 cores, 8 GiB).
+    /// These are the compiled-in FALLBACKS: Machine.discover (Kernel/DTB.swift)
+    /// parses the device tree at boot and overrides Machine.ramSizeMB /
+    /// Machine.cpuCount with the tree's values (identical on QEMU virt).
+    /// Consumers that run before discovery, or that must size static
+    /// structures, keep reading these constants (Scheduler/SMP/Panic read
+    /// cpuCount; KernelServices reads Machine.ramSizeMB for totalMemoryMB).
     static let ramMB = 8192
     static let cpuCount = 4
     /// PSCI CPU_ON bring-up of secondary cores (parked secondaries for now;

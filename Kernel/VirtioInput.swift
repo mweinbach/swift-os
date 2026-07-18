@@ -1,10 +1,13 @@
 // Virtio input driver (legacy virtio-mmio v1) for QEMU's virtio-keyboard and
 // virtio-tablet, plus serial-console keyboard input via the PL011 UART.
 //
-// QEMU virt exposes up to 32 virtio-mmio slots at 0x0A00_0000 + slot*0x200
+// QEMU virt exposes its virtio-mmio slots at 0x0A00_0000 + slot*0x200
 // (IRQ 16+slot — unused; we poll the used rings from the main loop). The
-// Makefile boots with -global virtio-mmio.force-legacy=on, so only the
-// legacy (v1) register interface is implemented.
+// slot base and count come from the device tree at boot
+// (Machine.virtioMmioBase/virtioMmioSlots, Kernel/DTB.swift) with those
+// values as the compiled-in defaults. The Makefile boots with -global
+// virtio-mmio.force-legacy=on, so only the legacy (v1) register interface
+// is implemented.
 //
 // Devices deliver evdev events through vring queue 0 (eventq) as
 //   struct virtio_input_event { u16 type; u16 code; u32 value; }
@@ -99,9 +102,9 @@ enum Input {
     static private(set) var mouseX: Int = Config.screenWidth / 2
     static private(set) var mouseY: Int = Config.screenHeight / 2
 
-    private static let mmioBase: UInt = 0x0A00_0000
+    private static var mmioBase: UInt { Machine.virtioMmioBase }
     private static let slotStride: UInt = 0x200
-    private static let slotCount = 32
+    private static var slotCount: Int { Machine.virtioMmioSlots }
     private static let bufLen: UInt = 64
     private static let absMax = 32767     // virtio tablet ABS_X/ABS_Y maximum
 

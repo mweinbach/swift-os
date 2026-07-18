@@ -1,7 +1,8 @@
 // Virtio block driver (legacy virtio-mmio v1) for QEMU's virtio-blk-device.
 //
-// Same discovery model as the input driver (see VirtioInput.swift): up to 32
-// virtio-mmio slots at 0x0A00_0000 + slot*0x200, legacy register interface
+// Same discovery model as the input driver (see VirtioInput.swift): the
+// virtio-mmio slots from the device tree (Machine.virtioMmioBase +
+// slot*0x200, default 0x0A00_0000, up to 32), legacy register interface
 // only (-global virtio-mmio.force-legacy=on), DeviceID 2 = block.
 //
 // I/O model: fully synchronous polled requests, one at a time, no IRQs. Every
@@ -51,9 +52,9 @@ enum BlockDev {
     /// forced a full device reset). Diagnostics only; never reset to 0.
     static private(set) var errorCount: Int = 0
 
-    private static let mmioBase: UInt = 0x0A00_0000
+    private static var mmioBase: UInt { Machine.virtioMmioBase }
     private static let slotStride: UInt = 0x200
-    private static let slotCount = 32
+    private static var slotCount: Int { Machine.virtioMmioSlots }
     private static let sectorSize = 512
 
     // Legacy virtio-mmio register offsets (same layout as VirtioInput).

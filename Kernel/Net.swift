@@ -3,9 +3,11 @@
 // Layers: ethernet (parse/build) → ARP (request/reply, 8-entry cache,
 // synchronous resolve) → IPv4 (header build/parse + checksum) → ICMP
 // (answers echo requests addressed to us; sends echo requests and times the
-// replies for the `ping` shell command). The demo target is QEMU's user-mode
-// networking (slirp): we are 10.0.2.15, the gateway 10.0.2.2 answers both
-// ARP and ICMP echo.
+// replies for the `ping` shell command) → UDP (datagram build/parse with a
+// single registered consumer) → DNS (synchronous A-record resolve against
+// slirp's 10.0.2.3 for nslookup/host/ping-by-name). The demo target is QEMU's
+// user-mode networking (slirp): we are 10.0.2.15, the gateway 10.0.2.2
+// answers both ARP and ICMP echo.
 //
 // Everything is polled and single-threaded: Net.poll() is called from the
 // kernel main loop (compositor), and Net.ping() pumps NetDev.pollRx() itself
@@ -56,9 +58,14 @@ enum Net {
     private static let ethARP: UInt16 = 0x0806
     private static let ethIPv4: UInt16 = 0x0800
     private static let protoICMP: UInt8 = 1
+    private static let protoUDP: UInt8 = 17
     private static let pingID: UInt16 = 0x5357       // "SW"
     private static let broadcastMAC: UInt64 = 0x0000_FFFF_FFFF_FFFF
     private static let pingPayload = 56              // data bytes (real ping)
+
+    /// QEMU slirp's built-in DNS forwarder (also reachable at the gateway,
+    /// but 10.0.2.3 is the documented virtual DNS address).
+    static let dnsServerIP: UInt32 = 0x0A00_0203
 
     /// Frame build area (ethernet header + IP packet, one page).
     private static var scratch: UInt = 0
@@ -199,6 +206,8 @@ enum Net {
             handleICMP(p + ihl, totalLen - ihl,
                        srcIP: rd32(p, 12), srcMAC: srcMAC,
                        ipHeader: p, ihl: ihl)
+        } else if rd8(p, 9) == protoUDP {
+            handleUDP(p + ihl, totalLen - ihl, srcIP: rd32(p, 12))
         }
     }
 
@@ -389,5 +398,249 @@ enum Net {
         lines.append("\(n) packets transmitted, \(received) packets received, "
                      + "\(NumFmt.f1(loss))% packet loss")
         return lines
+    }
+
+    // MARK: - UDP
+
+    /// Next ephemeral source port for udpSend (Linux's 49152...65535 range).
+    private static var ephemeralPort: UInt16 = 49152
+
+    /// The one registered UDP consumer: a destination port plus its handler.
+    /// Documented demux contract: exactly ONE registration exists at a time —
+    /// udpRegister replaces any previous one, udpUnregister clears it. That
+    /// is all the DNS client needs; a per-port table can come later.
+    private static var udpHandlerPort: UInt16 = 0
+    private static var udpHandler: ((UInt32, UInt16, [UInt8]) -> Void)?
+
+    /// Send one UDP datagram from an ephemeral source port. The payload must
+    /// fit one ethernet frame (MTU-safe cap 1472 = 1500-20-8). UDP checksum
+    /// is 0 — legal (optional) over IPv4, and slirp accepts it. False when
+    /// the stack is down, the payload is overlong, or ARP/tx fails.
+    static func udpSend(to ip: UInt32, port: UInt16, payload: [UInt8]) -> Bool {
+        let src = ephemeralPort
+        ephemeralPort = ephemeralPort == 65535 ? 49152 : ephemeralPort &+ 1
+        return udpSend(to: ip, port: port, from: src, payload: payload)
+    }
+
+    /// udpSend with an explicit source port (DNS needs a known port to listen
+    /// on). Payload sits at scratch+42, sendIPv4To wraps it in IP+ethernet.
+    private static func udpSend(to ip: UInt32, port: UInt16, from srcPort: UInt16,
+                                payload: [UInt8]) -> Bool {
+        guard ready, payload.count <= 1472 else { return false }
+        // Off-subnet destinations go via the gateway's MAC (same as ping).
+        let onSubnet = (ip & netmask) == (ourIP & netmask)
+        guard let mac = arpResolve(onSubnet ? ip : gatewayIP) else { return false }
+        let udp = scratch + 14 + 20
+        wr16(udp + 0, srcPort)
+        wr16(udp + 2, port)
+        wr16(udp + 4, UInt16(8 + payload.count))
+        wr16(udp + 6, 0)                          // checksum: none (IPv4)
+        var i = 0
+        while i < payload.count {
+            wr8(udp + 8 + UInt(i), payload[i])
+            i += 1
+        }
+        return sendIPv4To(mac, dstIP: ip, proto: protoUDP,
+                          payloadLen: 8 + payload.count)
+    }
+
+    /// Register THE one UDP consumer: handler(srcIP, srcPort, payload) fires
+    /// for datagrams addressed to `port`. Replaces any previous registration.
+    /// Runs on the kernel main thread (from NetDev.pollRx); the payload has
+    /// already been copied out of the rx buffer, so it stays valid.
+    static func udpRegister(port: UInt16,
+                            handler: @escaping (UInt32, UInt16, [UInt8]) -> Void) {
+        udpHandlerPort = port
+        udpHandler = handler
+    }
+
+    /// Drop the current registration (additive counterpart of udpRegister).
+    static func udpUnregister() {
+        udpHandler = nil
+        udpHandlerPort = 0
+    }
+
+    /// One received UDP datagram (header verified, checksum ignored — slirp
+    /// always fills it, and over IPv4 it is optional end to end). The payload
+    /// is copied into an array before the handler runs: the rx buffer is
+    /// reposted as soon as handleRxFrame returns.
+    private static func handleUDP(_ p: UnsafeRawPointer, _ len: Int, srcIP: UInt32) {
+        guard len >= 8 else { return }
+        let srcPort = rd16(p, 0)
+        let dstPort = rd16(p, 2)
+        let udpLen = Int(rd16(p, 4))
+        guard udpLen >= 8, udpLen <= len else { return }
+        guard let handler = udpHandler, dstPort == udpHandlerPort else { return }
+        var bytes: [UInt8] = []
+        bytes.reserveCapacity(udpLen - 8)
+        var i = 0
+        while i < udpLen - 8 {
+            bytes.append(rd8(p, 8 + i))
+            i += 1
+        }
+        handler(srcIP, srcPort, bytes)
+    }
+
+    // MARK: - DNS client
+
+    /// State of the one in-flight query (single-threaded main loop, so a
+    /// fixed slot is enough). dnsID matches replies to our question; the
+    /// outcome is dnsStatus: 0 pending, 1 answered, 2 refused, 3 bad reply.
+    private static var dnsActive = false
+    private static var dnsID: UInt16 = 0
+    private static var dnsStatus = 0
+    private static var dnsRcode = 0
+    private static var dnsAnswer: UInt32 = 0
+
+    /// Resolve `name` to its first A record via slirp's DNS at 10.0.2.3:53.
+    /// Returns EXACTLY "<name> has address a.b.c.d" on success, or
+    /// "dns: <name>: <reason>" on failure (bad name / network unavailable /
+    /// send failed / query timed out / refused / bad reply).
+    static func dnsResolve(_ name: String) -> String {
+        let result = dnsQuery(name)
+        if let ip = result.ip { return "\(name) has address \(dotted(ip))" }
+        return "dns: \(name): \(result.reason)"
+    }
+
+    /// Additive companion to dnsResolve: same single query, but returns the
+    /// address (nil on failure, reason discarded — callers that want the
+    /// reason string use dnsResolve). Used by `ping <hostname>`.
+    static func dnsResolveIPv4(_ name: String) -> UInt32? {
+        dnsQuery(name).ip
+    }
+
+    /// One synchronous recursive A-record query: register a throwaway UDP
+    /// listener, send the question, pump the rx queue for up to ~2 s, parse
+    /// the first A record out of the answer.
+    private static func dnsQuery(_ name: String) -> (ip: UInt32?, reason: String) {
+        guard ready else { return (nil, "network unavailable") }
+        // Uptime-based transaction id ("random-ish"), advanced per query.
+        let id = UInt16(truncatingIfNeeded: Clock.uptimeTicks / 977 &+ 0x5A5A)
+        guard let query = dnsBuildQuery(name, id: id) else {
+            return (nil, "bad name")
+        }
+        let port = ephemeralPort
+        ephemeralPort = ephemeralPort == 65535 ? 49152 : ephemeralPort &+ 1
+
+        dnsID = id
+        dnsStatus = 0
+        dnsRcode = 0
+        dnsAnswer = 0
+        dnsActive = true
+        udpRegister(port: port, handler: dnsHandleReply)
+        defer {
+            dnsActive = false
+            udpUnregister()
+        }
+        guard udpSend(to: dnsServerIP, port: 53, from: port, payload: query) else {
+            return (nil, "send failed")
+        }
+        let deadline = Clock.uptimeMs &+ 2000
+        while dnsStatus == 0, Clock.uptimeMs < deadline {
+            NetDev.pollRx()
+            armWfi()
+        }
+        switch dnsStatus {
+        case 1: return (dnsAnswer, "")
+        case 2: return (nil, "refused (rcode \(dnsRcode))")
+        case 3: return (nil, "bad reply")
+        default: return (nil, "query timed out")
+        }
+    }
+
+    /// Wire-format question for one A/IN record, 12-byte header included.
+    /// Nil for a malformed name (empty or >63-byte labels, >255-byte name).
+    /// A trailing dot is NOT special-cased — "swift.org." is rejected like
+    /// any other empty label (documented strictness, shell input is clean).
+    private static func dnsBuildQuery(_ name: String, id: UInt16) -> [UInt8]? {
+        var q: [UInt8] = []
+        q.reserveCapacity(18 + name.utf8.count)
+        q.append(UInt8(id >> 8)); q.append(UInt8(id & 0xFF))
+        q.append(0x01); q.append(0x00)                // flags: RD (recursion desired)
+        q.append(0); q.append(1)                      // QDCOUNT = 1
+        for _ in 0..<6 { q.append(0) }                // ANCOUNT/NSCOUNT/ARCOUNT
+        var wireLen = 1                               // the root zero byte
+        for label in name.split(separator: ".", omittingEmptySubsequences: false) {
+            let bytes = Array(label.utf8)
+            guard bytes.count >= 1, bytes.count <= 63 else { return nil }
+            wireLen += 1 + bytes.count
+            guard wireLen <= 255 else { return nil }
+            q.append(UInt8(bytes.count))
+            q.append(contentsOf: bytes)
+        }
+        q.append(0)                                   // end of QNAME
+        q.append(0); q.append(1)                      // QTYPE = A
+        q.append(0); q.append(1)                      // QCLASS = IN
+        return q
+    }
+
+    /// UDP handler for the in-flight query. Validates the header, then walks
+    /// the message WITHOUT general compression-pointer chasing: the question
+    /// section is skipped by label/pointer structure (qdcount entries), and
+    /// each answer RR is walked by rdlength. A 0xC0 pointer is TOLERATED as
+    /// a name terminator (its target is never followed) — that is all slirp's
+    /// answers need (its answer names are a single pointer into the question).
+    private static func dnsHandleReply(_ srcIP: UInt32, _ srcPort: UInt16,
+                                       _ p: [UInt8]) {
+        guard dnsActive, srcPort == 53, p.count >= 12 else { return }
+        let replyID = UInt16(p[0]) << 8 | UInt16(p[1])
+        guard replyID == dnsID else { return }        // not our question
+        let flags = UInt16(p[2]) << 8 | UInt16(p[3])
+        guard flags & 0x8000 != 0 else { return }     // QR: must be a response
+        let rcode = Int(flags & 0xF)
+        guard rcode == 0 else {                       // e.g. 3 = NXDOMAIN
+            dnsRcode = rcode
+            dnsStatus = 2
+            return
+        }
+        let qdcount = Int(UInt16(p[4]) << 8 | UInt16(p[5]))
+        let ancount = Int(UInt16(p[6]) << 8 | UInt16(p[7]))
+        var off = 12
+        // Skip QDCOUNT questions: name (labels, or a terminating pointer)
+        // plus QTYPE/QCLASS.
+        for _ in 0..<qdcount {
+            guard dnsSkipName(p, &off) else { dnsStatus = 3; return }
+            off += 4
+            guard off <= p.count else { dnsStatus = 3; return }
+        }
+        // Walk ANCOUNT resource records; first A/IN record with 4-byte rdata
+        // is the answer. Everything else is stepped over via rdlength.
+        var found: UInt32? = nil
+        var i = 0
+        while i < ancount {
+            guard dnsSkipName(p, &off) else { dnsStatus = 3; return }
+            guard off + 10 <= p.count else { dnsStatus = 3; return }
+            let rtype = Int(UInt16(p[off]) << 8 | UInt16(p[off + 1]))
+            let rclass = Int(UInt16(p[off + 2]) << 8 | UInt16(p[off + 3]))
+            let rdlen = Int(UInt16(p[off + 8]) << 8 | UInt16(p[off + 9]))
+            off += 10
+            guard off + rdlen <= p.count else { dnsStatus = 3; return }
+            if rtype == 1, rclass == 1, rdlen == 4, found == nil {
+                found = UInt32(p[off]) << 24 | UInt32(p[off + 1]) << 16
+                    | UInt32(p[off + 2]) << 8 | UInt32(p[off + 3])
+            }
+            off += rdlen
+            i += 1
+        }
+        if let found {
+            dnsAnswer = found
+            dnsStatus = 1
+        } else {
+            dnsStatus = 3                               // no A record in reply
+        }
+    }
+
+    /// Advance `off` past one wire-format domain name. A 0xC0 compression
+    /// pointer ends the name (2 bytes, target never followed); 0x40/0x80
+    /// label forms are reserved and treated as corruption.
+    private static func dnsSkipName(_ p: [UInt8], _ off: inout Int) -> Bool {
+        while true {
+            guard off < p.count else { return false }
+            let b = p[off]
+            if b == 0 { off += 1; return true }
+            if b & 0xC0 == 0xC0 { off += 2; return off <= p.count }
+            guard b & 0xC0 == 0 else { return false }
+            off += 1 + Int(b)
+        }
     }
 }

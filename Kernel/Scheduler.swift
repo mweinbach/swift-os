@@ -65,6 +65,18 @@
 // core. perCoreUsage() additionally exposes raw per-core busy/total tick
 // counters for the System Monitor's per-core bars.
 //
+// EL0 USER THREADS (Kernel/Userspace.swift): a slot carrying userL2 != 0
+// runs a scheduled user process at EL0 (its entry drops there via
+// arm_drop_el0 and never comes back — its exit syscall / fault / kill is
+// resolved here, see Userspace.swift). The switch hook in
+// pickAndSwitchLocked installs the incoming thread's private L2 in THIS
+// core's L1[userSlot] (MMU.switchUserMap + local TLB flush) whenever it
+// differs from the core's active map, and invalidates the slot on switch
+// to a kernel thread — one compare per switch, flush skipped for
+// kernel<->kernel transitions. Because the check runs on every switch of
+// every core, migration just works: the new core installs the map before
+// the thread resumes at EL0.
+//
 // STACK CANARIES: every spawned thread's stack is filled with 0xAA and
 // carries a 16-byte canary (two UInt64 magics) at its BASE. AArch64 stacks
 // grow down, so an overflow clobbers the base last before running off the
@@ -102,6 +114,10 @@ func armIrqSave() -> UInt
 func armIrqRestore(_ daif: UInt)
 @_silgen_name("arm_read_mpidr")
 private func armReadMpidr() -> UInt
+@_silgen_name("arm_read_sp_el0")
+private func armReadSpEl0() -> UInt
+@_silgen_name("arm_write_sp_el0")
+private func armWriteSpEl0(_ sp: UInt)
 
 enum Scheduler {
     /// Hardware cap on concurrent kernel threads (fixed table, never grows).
@@ -141,6 +157,20 @@ enum Scheduler {
         var taskID = 0                  // Tasks registry id (ps/System Monitor)
         var runningOnCPU = -1           // core currently executing this slot, else -1
         var pinnedCPU = -1              // -1 = may run anywhere; else only this core
+        /// User-process table index (Kernel/Userspace.swift) when this
+        /// thread runs an EL0 process, else -1. Immutable after publish.
+        var userProc = -1
+        /// Per-process user-map L2 table (MMU.switchUserMap installs it in
+        /// the running core's L1[userSlot]), 0 for kernel threads — the
+        /// cheap isUserThread test in the switch path. Immutable post-publish.
+        var userL2: UInt = 0
+        /// Saved SP_EL0 for user threads: SP_EL0 is PER-CORE state, so it
+        /// is also per-thread context — the switch hook saves it here on
+        /// switch-out and restores it on switch-in (a thread resumed on a
+        /// core that never dropped it would otherwise inherit a stale
+        /// SP_EL0: another process's, the legacy demo's, or reset garbage).
+        /// Initialized at spawn to the process's user stack top.
+        var userSP: UInt = 0
     }
 
     /// Raw TCB table: one heap page, allocated and bound in initScheduler.
@@ -181,6 +211,12 @@ enum Scheduler {
     private static var coreOnline = [Bool](repeating: false, count: Config.cpuCount)
     /// Each core's idle slot (cpu 0 -> 1; cpu N>0 -> 2+N; -1 when !smpEnabled).
     private static var idleSlotOfCpu = [Int](repeating: -1, count: Config.cpuCount)
+    /// L2 table of the user process whose map is installed in this core's
+    /// L1[userSlot] right now (0 = none: the slot is invalid). Kept in sync
+    /// by the switch hook in pickAndSwitchLocked — compared against the
+    /// incoming thread's userL2 on every switch, so kernel<->kernel
+    /// switches (both 0) cost one array load and no TLB maintenance.
+    private static var activeUserL2 = [UInt](repeating: 0, count: Config.cpuCount)
 
     private static var initialized = false
     private static var ticksSinceCanaryCheck = 0
@@ -251,6 +287,7 @@ enum Scheduler {
         _ = Locks.sched
         _ = Locks.tasks
         _ = spinSerial
+        UserProcess.warmStatics()
 
         // Slot 0: the boot/main thread. Pinned to cpu 0 — the compositor,
         // userland apps, virtio drivers and the framebuffer stay there.
@@ -269,6 +306,7 @@ enum Scheduler {
             totalTicks[c] = 0
             coreOnline[c] = (c == 0)
             idleSlotOfCpu[c] = c == 0 ? 1 : (Config.smpEnabled ? 2 &+ c : -1)
+            activeUserL2[c] = 0                 // no user map installed yet
             c &+= 1
         }
         initialized = true
@@ -292,6 +330,16 @@ enum Scheduler {
     /// is full or the stack allocation fails. Thread context only — this
     /// allocates (heap page pool + Tasks registry).
     ///
+    /// `userProc`/`userL2`/`userSP` mark the thread as running a scheduled
+    /// EL0 user process (UserProcess.spawn): userProc is the Userspace
+    /// process-table index (handed back to UserProcess.reapProcess at
+    /// reap), userL2 is the process's private L2 table (installed in the
+    /// running core's L1[userSlot] by the switch hook), and userSP is the
+    /// initial SP_EL0 (the window stack top; saved/restored across
+    /// switches afterwards). All default to kernel-thread values and are
+    /// published with the slot, so the switch hook can never observe a
+    /// half-marked user thread.
+    ///
     /// Hardening notes:
     /// - Two-phase: all allocation (stack pages, Tasks registry) happens
     ///   lock-free in phase A; phase B takes Locks.sched only to scan for a
@@ -301,7 +349,9 @@ enum Scheduler {
     ///   registry entry removed and the pages freed.
     /// - A zero-length name registers as "thread".
     @discardableResult
-    static func spawn(name: String, stackPages: Int, entry: @escaping () -> Never) -> Int {
+    static func spawn(name: String, stackPages: Int, userProc: Int = -1,
+                      userL2: UInt = 0, userSP: UInt = 0,
+                      entry: @escaping () -> Never) -> Int {
         guard Config.enableScheduler, initialized, stackPages > 0 else { return -1 }
         guard let tcbs else { return -1 }
 
@@ -359,6 +409,9 @@ enum Scheduler {
         tcbs[slot].taskID = taskID
         tcbs[slot].runningOnCPU = -1
         tcbs[slot].pinnedCPU = -1
+        tcbs[slot].userProc = userProc
+        tcbs[slot].userL2 = userL2
+        tcbs[slot].userSP = userSP
         entries[slot] = entry               // thread-context side table
         panicNotes[slot] = "stack overflow in thread \(slot)"
         tcbs[slot].used = true              // publish last
@@ -401,6 +454,27 @@ enum Scheduler {
     /// Table slot of the thread currently running on THIS core
     /// (0 = boot/main thread).
     static var currentThreadID: Int { currentSlot[thisCpu()] }
+
+    /// User-process table index of the thread running on THIS core, or -1
+    /// for a kernel thread. Read lock-free by the EL0 sync handler: it runs
+    /// on the faulting/syscalling thread itself with IRQs masked (exception
+    /// entry), so this core's current slot cannot change under it, and a
+    /// slot's userProc is immutable between publish and reap.
+    static var currentUserProc: Int {
+        guard initialized, let tcbs else { return -1 }
+        return tcbs[currentSlot[thisCpu()]].userProc
+    }
+
+    /// Tasks-registry id (ps/top pid) of the thread in `slot`, or -1.
+    /// Lock-free: a slot's taskID is immutable between publish and reap.
+    /// UserProcess.spawn resolves its returned pid through this.
+    static func taskID(ofSlot slot: Int) -> Int {
+        guard initialized, let tcbs, slot >= 0, slot < maxThreads else { return -1 }
+        return tcbs[slot].used ? tcbs[slot].taskID : -1
+    }
+
+    /// This core's index (for log lines outside the scheduler).
+    static var currentCpu: Int { thisCpu() }
 
     // MARK: - Thread termination (exit / kill / reap)
 
@@ -478,6 +552,7 @@ enum Scheduler {
             var base: UInt = 0
             var pages = 0
             var taskID = 0
+            var uproc = -1
             var found = false
             let saved = Locks.lockIrqSave(Locks.sched)
             if tcbs[i].used, tcbs[i].state == .zombie, tcbs[i].runningOnCPU == -1 {
@@ -485,10 +560,16 @@ enum Scheduler {
                 // the thread last ran: its stack is abandoned (the core
                 // that switched away from it held this lock across the
                 // switch, so acquiring the lock proves the switch finished).
+                // For a user thread it also means its EL0 map is installed
+                // NOWHERE: the switch hook replaced it on every core that
+                // ever ran the thread (the hook runs on every switch), and
+                // flushed those cores' TLBs — freeing its pages cannot be
+                // observed through a stale translation.
                 found = true
                 base = tcbs[i].stackBase
                 pages = tcbs[i].stackPages
                 taskID = tcbs[i].taskID
+                uproc = tcbs[i].userProc
                 entries[i] = nil
                 panicNotes[i] = ""
                 tcbs[i] = TCB()         // whole-slot reset, published atomically
@@ -497,6 +578,9 @@ enum Scheduler {
             if found {
                 if base != 0 {
                     KernelHeap.freePages(base, count: pages)
+                }
+                if uproc >= 0 {
+                    UserProcess.reapProcess(uproc)   // frees the EL0 pages + map
                 }
                 Tasks.unregister(id: taskID)
                 klog("[sched] reaped thread \(i) (task \(taskID)) — slot free")
@@ -522,12 +606,14 @@ enum Scheduler {
 
         let saved = Locks.lockIrqSave(Locks.sched)
 
-        // Per-core accounting: bill the slot current on THIS cpu.
+        // Per-core accounting: bill the slot current on THIS cpu. The core's
+        // idle slot is excluded everywhere: it sleeps in wfi between ticks
+        // and should always read 0% busy.
         totalTicks[cpu] &+= 1
         let cur = currentSlot[cpu]
-        if tcbs[cur].used {
+        if tcbs[cur].used, cur != idleSlotOfCpu[cpu] {
             tcbs[cur].ticksRan &+= 1
-            if cur != idleSlotOfCpu[cpu] { busyTicks[cpu] &+= 1 }
+            busyTicks[cpu] &+= 1
         }
 
         // Wake due sleepers (every core scans; idempotent under the lock).
@@ -701,6 +787,12 @@ enum Scheduler {
               cpu > 0, cpu < Config.cpuCount, 2 &+ cpu < maxThreads else {
             while true { armWfi() }
         }
+        // Give this core its private L0/L1 pair (pre-built on the BSP in
+        // MMU.initMMU): the kernel mappings are identical to the replayed
+        // BSP tables, so this changes no translation — it only gives the
+        // core its own L1[userSlot] to flip when it schedules EL0 user
+        // threads (a shared L1 could hold only one core's user map).
+        MMU.useCoreTables(cpu: cpu)
         let slot = 2 &+ cpu
         let taskID = Tasks.register(name: "idle\(cpu)", memoryMB: 0)
 
@@ -786,6 +878,30 @@ enum Scheduler {
         currentSlot[cpu] = next
         rrCursor[cpu] = next
         quantumLeft[cpu] = quantumTicks
+        // User-map switch (BEFORE the thread switch): give this core the
+        // incoming thread's EL0 window — or none (0) for a kernel thread.
+        // One compare covers every case: first switch-in, switch-out,
+        // user->user, and MIGRATION (the thread last ran on another core,
+        // so this core's activeUserL2 differs and its map is installed +
+        // the local TLB flushed here). Kernel<->kernel switches (both 0)
+        // skip the flush entirely. switchUserMap is allocation- and
+        // lock-free — legal here (sched lock held, possibly IRQ context).
+        let nextL2 = tcbs[next].userL2
+        if nextL2 != activeUserL2[cpu] {
+            MMU.switchUserMap(cpu: cpu, l2: nextL2)
+            activeUserL2[cpu] = nextL2
+        }
+        // SP_EL0 is per-core state — for user threads it is per-thread
+        // context and must travel with the thread: save the outgoing
+        // thread's live user SP, restore the incoming one's (the value at
+        // spawn is its window stack top; later saves are the preempted
+        // value, so a thread resumes with exactly its own stack pointer on
+        // whatever core it lands on). For the OUTGOING thread SP_EL0 is
+        // the live EL0 stack pointer: every switch path runs at EL1 with
+        // the user SP parked in the system register (tick preemption,
+        // svc-yield, exit — all of them).
+        if tcbs[prev].userL2 != 0 { tcbs[prev].userSP = armReadSpEl0() }
+        if nextL2 != 0 { armWriteSpEl0(tcbs[next].userSP) }
         let newSP = tcbs[next].sp
         armSwitchContext(&tcbs[prev].sp, newSP)
         // Returns here when THIS thread is picked again on some core; the

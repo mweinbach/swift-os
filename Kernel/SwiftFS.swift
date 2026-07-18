@@ -12,7 +12,8 @@
 //                       +32 bitmapSectors u32
 //                       +36 dataStart u32        (first data sector)
 //                       +40 blockSizeSectors u32 (8 = 4 KiB blocks)
-//                       +44 reserved u32
+//                       +44 journalStart u32     (0 = legacy image, no journal)
+//                       +48 journalSectors u32   (0 = legacy image, no journal)
 //   1 ..< 33          inode table: 256 inodes x 64 bytes:
 //                       +0  name[44]   UTF-8, zero-padded (truncated at a
 //                                     scalar boundary when longer)
@@ -30,16 +31,48 @@
 //                                     pre-existing files show odd dates until
 //                                     rewritten; magic deliberately unchanged.)
 //   bitmapStart ..    free bitmap, 1 bit per data block (1 = used)
+//   journalStart ..   metadata journal (journalSectors sectors; absent on
+//                     legacy images — see JOURNAL below)
 //   dataStart ..      data blocks, 8 sectors (4 KiB) each
 //
 // Design (per spec): directories have no data blocks — membership is encoded
 // by the inode's parent link, so listing a directory is a scan of the inode
 // table. Files are a single contiguous span; allocation is first-fit over the
-// bitmap. Writes that fit the current span go in place; growth allocates a
-// fresh contiguous span, writes it, then frees the old one (grow-only — a
-// span never moves unless it has to). Every metadata mutation flushes its
-// sector(s) immediately (write-through); there is no journal, so an unlucky
-// power cut can lose the last write — acceptable for a demo OS.
+// bitmap. Every content write is COPY-ON-WRITE: a fresh span is allocated and
+// written, then ONE journaled inode flush repoints the file (the old span is
+// freed only after the flip lands). A crash therefore always leaves the old
+// file or the new file, never a torn one — at the price of a block leak in
+// the crash window (harmless; the offline checker reports leaks as warnings).
+//
+// JOURNAL (physical redo, metadata only): every metadata sector mutation
+// (inode-table sector, bitmap sector) is appended to the journal BEFORE it
+// may reach its real location. One record = 3 sectors in a circular slot:
+//
+//   +0  payload  (512 bytes: the new contents of the target sector)
+//   +1  header   +0 magic u32 "JNHR"  +4 seq u32  +8 targetSector u64
+//                +16 payloadChecksum u32 (FNV-1a)  +20 headerChecksum u32
+//   +2  commit   +0 magic u32 "JNCM"  +4 seq u32  +8 checksum u32
+//
+// Write order: payload -> header -> commit -> THEN the real sector. The
+// commit sector is the record's durability point: a record without a valid
+// commit is ignored at mount (its real sector was never touched); a
+// committed record whose real write was cut short is redone at mount
+// (idempotent sector rewrite). Journal slot = seq % slotCount, so the slots
+// always hold a contiguous range of the newest <= slotCount records and
+// replaying them in ascending seq order makes newest-wins for duplicate
+// target sectors. Journal sector 0 is the journal superblock ("JNSB" +
+// checkpointSeq): records with seq <= checkpointSeq are known-applied and
+// skipped at mount. Checkpointing is trivially safe because records are
+// applied synchronously at commit time (write-through for reads is
+// unchanged); it runs inline every 16 records and after a replay — no
+// kworker, no locking: SwiftFS is only ever called from the main thread
+// (the VFS), same as BlockDev. Mount klogs "[fs] journal replayed N
+// records" or "[fs] journal: clean".
+//
+// Legacy images (journalSectors == 0, e.g. disks written before the journal
+// existed) mount read/write with journaling OFF (klogged); blank disks are
+// formatted WITH a journal. format() writes the superblock LAST so an
+// interrupted format never leaves a mountable half-image.
 //
 // The whole inode table (16 KiB) and bitmap (<= a few KiB) are cached in RAM
 // (plain Swift arrays — SwiftFS is a client of the heap, never underneath it).
@@ -65,6 +98,16 @@ enum SwiftFS {
     private static var dataStart: UInt32 = 0
     private static var dataBlocks: Int = 0
 
+    // Journal geometry/state (filled in by mount()/format()). journalActive
+    // is false on legacy images: flushes then go straight to disk.
+    private static var journalActive = false
+    private static var journalStart: UInt32 = 0
+    private static var journalSectors: UInt32 = 0
+    private static var journalSlots = 0          // (journalSectors - 1) / 3
+    private static var nextSeq: UInt32 = 1       // seq of the next record
+    private static var checkpointSeq: UInt32 = 0 // records <= this are applied
+    private static var lastAppliedSeq: UInt32 = 0
+
     // Constants of the format.
     private static let inodeCount = 256
     private static let inodeSize = 64
@@ -73,6 +116,20 @@ enum SwiftFS {
     private static let blockSectors = 8
     private static let blockBytes = blockSectors * 512   // 4096
     private static let nameMax = 44
+
+    // Constants of the journal (see the layout comment at the top).
+    private static let journalTotalSectors: UInt32 = 64  // 1 super + 21 slots x 3
+    private static let jMagicSuper: UInt32 = 0x4A4E_5342   // "JNSB"
+    private static let jMagicHeader: UInt32 = 0x4A4E_4852  // "JNHR"
+    private static let jMagicCommit: UInt32 = 0x4A4E_434D  // "JNCM"
+    private static let jCheckpointEvery: UInt32 = 16
+
+    // Reusable 512-byte scratch sectors for journal writes (SwiftFS is a
+    // client of the heap; these are plain arrays, main-thread only).
+    private static var jPayloadBuf = [UInt8](repeating: 0, count: 512)
+    private static var jHeaderBuf = [UInt8](repeating: 0, count: 512)
+    private static var jCommitBuf = [UInt8](repeating: 0, count: 512)
+    private static var jSuperBuf = [UInt8](repeating: 0, count: 512)
 
     // Inode field offsets within an inode.
     private static let oName = 0, oType = 44, oParent = 45, oFlags = 46
@@ -91,6 +148,7 @@ enum SwiftFS {
     /// bitmap. Returns false on any inconsistency (blank or foreign disk).
     static func mount() -> Bool {
         isMounted = false
+        journalActive = false
         guard let sb = readSectors(0, 1) else { return false }
         let magic: [UInt8] = [0x53, 0x57, 0x46, 0x53, 0x30, 0x30, 0x30, 0x31] // "SWFS0001"
         for i in 0..<8 where sb[i] != magic[i] { return false }
@@ -103,11 +161,33 @@ enum SwiftFS {
         let bmSectors = getU32(sb, 32)
         let dStart = getU32(sb, 36)
         let blkSectors = Int(getU32(sb, 40))
+        let jStart = getU32(sb, 44)
+        let jSectors = getU32(sb, 48)
+
+        // Two legal shapes: legacy (no journal: jStart/jSectors both zero,
+        // data right after the bitmap) and journaled (journal between the
+        // bitmap and the data area, 1 superblock + N x 3-sector slots).
+        // Anything else is a corrupt superblock — refuse to mount.
+        var slots = 0
+        if jSectors == 0 {
+            guard jStart == 0, dStart == bmStart + bmSectors else {
+                klog("[fs] superblock failed sanity checks — not mounting")
+                return false
+            }
+        } else {
+            let spanOk = jStart == bmStart + bmSectors &&
+                dStart == jStart + jSectors &&
+                jSectors >= 4 && (jSectors - 1) % 3 == 0
+            guard spanOk else {
+                klog("[fs] superblock failed sanity checks — not mounting")
+                return false
+            }
+            slots = Int((jSectors - 1) / 3)
+        }
 
         guard inodes == inodeCount, blkSectors == blockSectors,
               itStart == inodeTableStart, itSectors == inodeTableSectors,
               bmStart == inodeTableStart + inodeTableSectors, bmSectors >= 1,
-              dStart == bmStart + bmSectors,
               UInt64(dStart) < total, total <= BlockDev.blockCount else {
             klog("[fs] superblock failed sanity checks — not mounting")
             return false
@@ -123,12 +203,27 @@ enum SwiftFS {
             return false
         }
 
+        // Replay BEFORE loading the RAM caches: committed-but-unapplied
+        // records rewrite their real sectors here, so the caches below
+        // always see post-replay state.
+        if jSectors > 0 {
+            journalStart = jStart
+            journalSectors = jSectors
+            journalSlots = slots
+            journalActive = true
+            journalRecover()
+        } else {
+            klog("[fs] legacy image (no journal region) — metadata journaling off")
+        }
+
         guard let table = readSectors(UInt64(itStart), Int(itSectors)),
               let bm = readSectors(UInt64(bmStart), Int(bmSectors)) else {
+            journalActive = false
             return false
         }
         guard table[0 + oType] == tDir else {
             klog("[fs] no root directory — not mounting")
+            journalActive = false
             return false
         }
         inodeTable = table
@@ -138,10 +233,13 @@ enum SwiftFS {
         return true
     }
 
-    /// Lays out a fresh filesystem over the whole disk and creates the root
-    /// directory (inode 0). Returns false if the disk is implausibly small.
+    /// Lays out a fresh journaled filesystem over the whole disk and creates
+    /// the root directory (inode 0). Returns false if the disk is implausibly
+    /// small. The superblock is written LAST, so a power cut mid-format
+    /// leaves an unmountable disk that the next boot simply reformats.
     static func format() -> Bool {
         isMounted = false
+        journalActive = false
         let total = BlockDev.blockCount
         guard total >= 128 else {
             klog("[fs] disk too small to format (\(total) sectors)")
@@ -149,17 +247,45 @@ enum SwiftFS {
         }
 
         // bitmapSectors and dataStart depend on each other; iterate to a fixpoint.
+        // The journal sits between the bitmap and the data area.
         var bmSectors: UInt32 = 1
         while true {
-            let dStart = inodeTableStart + inodeTableSectors + bmSectors
+            let dStart = inodeTableStart + inodeTableSectors + bmSectors + journalTotalSectors
             let blocks = Int(total - UInt64(dStart)) / blockSectors
             let need = UInt32((blocks + 8 * 512 - 1) / (8 * 512))
             if need <= bmSectors { break }
             bmSectors = need
         }
-        let dStart = inodeTableStart + inodeTableSectors + bmSectors
+        let jStart = inodeTableStart + inodeTableSectors + bmSectors
+        let dStart = jStart + journalTotalSectors
         let blocks = Int(total - UInt64(dStart)) / blockSectors
 
+        totalSectors = total
+        bitmapStart = inodeTableStart + inodeTableSectors
+        bitmapSectors = bmSectors
+        dataStart = dStart
+        dataBlocks = blocks
+        journalStart = jStart
+        journalSectors = journalTotalSectors
+        journalSlots = Int((journalTotalSectors - 1) / 3)
+        inodeTable = [UInt8](repeating: 0, count: inodeCount * inodeSize)
+        bitmap = [UInt8](repeating: 0, count: Int(bmSectors) * 512)
+
+        // Inode table + bitmap go down unjournaled (nothing to redo yet),
+        // then the journal region is zeroed (all slots invalid) and its
+        // superblock written with an empty checkpoint.
+        guard flushInodeTable(), flushBitmap(bits: 0..<dataBlocks) else { return false }
+        guard writeSectors(UInt64(journalStart), Int(journalTotalSectors),
+                           [UInt8](repeating: 0, count: Int(journalTotalSectors) * 512)) else {
+            return false
+        }
+        nextSeq = 1
+        checkpointSeq = 0
+        lastAppliedSeq = 0
+        guard journalCheckpoint(upto: 0) else { return false }
+
+        // The superblock commits the format: until it lands, the disk is
+        // garbage and the next boot formats again.
         var sb = [UInt8](repeating: 0, count: 512)
         let magic: [UInt8] = [0x53, 0x57, 0x46, 0x53, 0x30, 0x30, 0x30, 0x31]
         for i in 0..<8 { sb[i] = magic[i] }
@@ -171,25 +297,20 @@ enum SwiftFS {
         setU32(&sb, 32, bmSectors)
         setU32(&sb, 36, dStart)
         setU32(&sb, 40, UInt32(blockSectors))
+        setU32(&sb, 44, journalStart)
+        setU32(&sb, 48, journalTotalSectors)
         guard writeSectors(0, 1, sb) else { return false }
 
-        totalSectors = total
-        bitmapStart = inodeTableStart + inodeTableSectors
-        bitmapSectors = bmSectors
-        dataStart = dStart
-        dataBlocks = blocks
-        inodeTable = [UInt8](repeating: 0, count: inodeCount * inodeSize)
-        bitmap = [UInt8](repeating: 0, count: Int(bmSectors) * 512)
-        guard flushInodeTable(), flushBitmap(bits: 0..<dataBlocks) else { return false }
+        journalActive = true
 
-        // Inode 0: the root directory.
+        // Inode 0: the root directory (journaled like any later mutation).
         encodeName("/", into: 0)
         inodeTable[oType] = tDir
         inodeTable[oParent] = 0
         guard flushInode(0) else { return false }
 
         isMounted = true
-        klog("[fs] formatted: \(total) sectors, \(blocks) data blocks")
+        klog("[fs] formatted: \(total) sectors, \(blocks) data blocks, journal \(journalSlots) slots")
         return true
     }
 
@@ -234,8 +355,13 @@ enum SwiftFS {
         return buf
     }
 
-    /// Writes a file's full contents. Fits go into the existing span in
-    /// place; growth allocates a new contiguous span and frees the old one.
+    /// Writes a file's full contents, copy-on-write: a fresh span is
+    /// allocated and filled, then ONE journaled inode flush repoints the
+    /// file at it (size/mtime travel with the same flush, so content and
+    /// metadata commit atomically). The old span is freed only AFTER the
+    /// flip lands — a crash in the window leaks blocks (reported as a
+    /// warning by the offline checker) but never leaves the inode pointing
+    /// at freed or half-written data. Never writes in place.
     /// `mtime` is seconds since 2024-01-01 UTC (the VFS converts wall-clock
     /// ms at the boundary); it is stored truncated to u32 on disk.
     static func writeFile(_ index: Int, _ data: [UInt8], mtime: UInt64) -> Bool {
@@ -246,16 +372,8 @@ enum SwiftFS {
         let curFirst = Int(getU32(inodeTable, b + oFirst))
         let curCount = Int(getU32(inodeTable, b + oCount))
 
-        if needed <= curCount {
-            if needed > 0 {
-                var buf = [UInt8](repeating: 0, count: needed * blockBytes)
-                var i = 0
-                while i < data.count { buf[i] = data[i]; i += 1 }
-                guard writeSectors(sectorOf(block: curFirst), needed * blockSectors, buf) else {
-                    return false
-                }
-            }
-        } else {
+        var newFirst = 0, newCount = 0
+        if needed > 0 {
             guard let span = allocBlocks(needed) else {
                 klog("[fs] out of space: need \(needed) blocks, wrote nothing")
                 return false
@@ -267,13 +385,16 @@ enum SwiftFS {
                 freeBlocks(span, needed)
                 return false
             }
-            if curCount > 0 { freeBlocks(curFirst, curCount) }
-            setU32(&inodeTable, b + oFirst, UInt32(span))
-            setU32(&inodeTable, b + oCount, UInt32(needed))
+            newFirst = span
+            newCount = needed
         }
+        setU32(&inodeTable, b + oFirst, UInt32(newFirst))
+        setU32(&inodeTable, b + oCount, UInt32(newCount))
         setU32(&inodeTable, b + oSize, UInt32(data.count))
         setU32(&inodeTable, b + oMtime, UInt32(mtime & 0xFFFF_FFFF))
-        return flushInode(index)
+        guard flushInode(index) else { return false }  // new span leaks on device fault
+        if curCount > 0 { freeBlocks(curFirst, curCount) }
+        return true
     }
 
     // MARK: - Inode create / remove
@@ -305,18 +426,83 @@ enum SwiftFS {
         return idx
     }
 
+    /// Creates a file inode and its contents as ONE atomic metadata commit:
+    /// the data span is allocated and written first, then a single journaled
+    /// inode flush publishes name+parent+span+size together. A crash anywhere
+    /// leaves either no trace or the complete file — never a zero-length
+    /// phantom (the old create()+writeFile() pair had that window; the VFS
+    /// uses this for new files instead). `mtime` is seconds since
+    /// 2024-01-01 UTC (see writeFile). Returns the inode index, or nil on
+    /// failure (full table, bad name, out of space, or device fault).
+    static func createFile(name: String, parent: Int, executable: Bool,
+                           mtime: UInt64, data: [UInt8]) -> Int? {
+        guard isMounted, parent >= 0, parent < inodeCount else { return nil }
+        var idx = 1   // inode 0 is the root
+        while idx < inodeCount {
+            if inodeTable[idx * inodeSize + oType] == tFree { break }
+            idx += 1
+        }
+        guard idx < inodeCount else {
+            klog("[fs] inode table full (\(inodeCount) inodes)")
+            return nil
+        }
+        let needed = (data.count + blockBytes - 1) / blockBytes
+        var first = 0, count = 0
+        if needed > 0 {
+            guard let span = allocBlocks(needed) else {
+                klog("[fs] out of space: need \(needed) blocks, wrote nothing")
+                return nil
+            }
+            var buf = [UInt8](repeating: 0, count: needed * blockBytes)
+            var i = 0
+            while i < data.count { buf[i] = data[i]; i += 1 }
+            guard writeSectors(sectorOf(block: span), needed * blockSectors, buf) else {
+                freeBlocks(span, needed)
+                return nil
+            }
+            first = span
+            count = needed
+        }
+        let b = idx * inodeSize
+        var i = 0
+        while i < inodeSize { inodeTable[b + i] = 0; i += 1 }
+        guard encodeName(name, into: idx) else {
+            if count > 0 { freeBlocks(first, count) }
+            return nil
+        }
+        inodeTable[b + oType] = tFile
+        inodeTable[b + oParent] = UInt8(parent)
+        setU16(&inodeTable, b + oFlags, executable ? 1 : 0)
+        setU32(&inodeTable, b + oSize, UInt32(data.count))
+        setU32(&inodeTable, b + oFirst, UInt32(first))
+        setU32(&inodeTable, b + oCount, UInt32(count))
+        setU32(&inodeTable, b + oMtime, UInt32(mtime & 0xFFFF_FFFF))
+        guard flushInode(idx) else {
+            // Undo the RAM cache so it matches the (unflushed) disk slot;
+            // the span leaks on a real device fault rather than dangling.
+            var j = 0
+            while j < inodeSize { inodeTable[b + j] = 0; j += 1 }
+            return nil
+        }
+        return idx
+    }
+
     /// Frees an inode and its data span. The root can never be removed; the
-    /// VFS guarantees directories are empty before this is called.
+    /// VFS guarantees directories are empty before this is called. The inode
+    /// is zeroed and flushed FIRST, the span freed after — a crash in
+    /// between leaks blocks instead of leaving the inode pointing at freed
+    /// (and potentially reallocated) ones.
     static func remove(_ index: Int) -> Bool {
         guard isMounted, index > 0, index < inodeCount else { return false }
         let b = index * inodeSize
         guard inodeTable[b + oType] != tFree else { return true }
         let first = Int(getU32(inodeTable, b + oFirst))
         let count = Int(getU32(inodeTable, b + oCount))
-        if count > 0 { freeBlocks(first, count) }
         var i = 0
         while i < inodeSize { inodeTable[b + i] = 0; i += 1 }
-        return flushInode(index)
+        guard flushInode(index) else { return false }
+        if count > 0 { freeBlocks(first, count) }
+        return true
     }
 
     /// Renames and/or reparents a live inode: rewrites the 44-byte name field
@@ -396,7 +582,7 @@ enum SwiftFS {
             guard let base = ptr.baseAddress else { ok = false; return }
             var s = firstSector
             while s <= lastSector {
-                if !BlockDev.writeBlocks(UInt64(bitmapStart) + UInt64(s), 1,
+                if !writeSectorJournaled(UInt64(bitmapStart) + UInt64(s),
                                          from: base.advanced(by: s * 512)) {
                     ok = false
                     return
@@ -416,13 +602,15 @@ enum SwiftFS {
         var ok = true
         inodeTable.withUnsafeBytes { ptr in
             guard let base = ptr.baseAddress else { ok = false; return }
-            ok = BlockDev.writeBlocks(UInt64(inodeTableStart) + UInt64(sectorInTable), 1,
+            ok = writeSectorJournaled(UInt64(inodeTableStart) + UInt64(sectorInTable),
                                       from: base.advanced(by: sectorInTable * 512))
         }
         if !ok { klog("[fs] inode flush failed (inode \(index))") }
         return ok
     }
 
+    /// Whole-table write, used only by format() before the superblock lands
+    /// (nothing to journal yet — an interrupted format reformats next boot).
     private static func flushInodeTable() -> Bool {
         var ok = true
         inodeTable.withUnsafeBytes { ptr in
@@ -431,6 +619,153 @@ enum SwiftFS {
                                       from: base)
         }
         return ok
+    }
+
+    // MARK: - Journal (physical redo of metadata sectors)
+
+    /// One metadata sector to disk: through the journal when the image has
+    /// one, direct on legacy images (and during format).
+    private static func writeSectorJournaled(_ lba: UInt64, from src: UnsafeRawPointer) -> Bool {
+        if journalActive {
+            return journalWrite(lba: lba, from: src)
+        }
+        return BlockDev.writeBlocks(lba, 1, from: src)
+    }
+
+    /// Appends one record {seq, lba, 512 payload bytes} to the journal and
+    /// applies it. Write order: payload, header, commit marker, THEN the
+    /// real sector — the commit marker is the durability point. A power cut
+    /// before the commit leaves the real sector untouched and the record is
+    /// ignored at mount; a cut after it is redone by journalRecover().
+    private static func journalWrite(lba: UInt64, from src: UnsafeRawPointer) -> Bool {
+        var i = 0
+        while i < 512 {
+            jPayloadBuf[i] = src.load(fromByteOffset: i, as: UInt8.self)
+            i += 1
+        }
+        let seq = nextSeq
+        let slot = Int(seq % UInt32(journalSlots))
+        let base = UInt64(journalStart) + 1 + UInt64(slot * 3)
+
+        guard writeSectors(base, 1, jPayloadBuf) else { return false }
+
+        var j = 0
+        while j < 512 { jHeaderBuf[j] = 0; j += 1 }
+        setU32(&jHeaderBuf, 0, jMagicHeader)
+        setU32(&jHeaderBuf, 4, seq)
+        setU64(&jHeaderBuf, 8, lba)
+        setU32(&jHeaderBuf, 16, fnv1a(jPayloadBuf, 0, 512))
+        setU32(&jHeaderBuf, 20, fnv1a(jHeaderBuf, 0, 20))
+        guard writeSectors(base + 1, 1, jHeaderBuf) else { return false }
+
+        var k = 0
+        while k < 512 { jCommitBuf[k] = 0; k += 1 }
+        setU32(&jCommitBuf, 0, jMagicCommit)
+        setU32(&jCommitBuf, 4, seq)
+        setU32(&jCommitBuf, 8, fnv1a(jCommitBuf, 0, 8))
+        guard writeSectors(base + 2, 1, jCommitBuf) else { return false }
+
+        // Committed — apply to the real location (replay redoes exactly this
+        // write if the power dies inside it).
+        guard writeSectors(lba, 1, jPayloadBuf) else { return false }
+        lastAppliedSeq = seq
+        nextSeq = seq &+ 1
+        if nextSeq == 0 { nextSeq = 1 }   // seq 0 stays unused even at u32 wrap
+        if lastAppliedSeq &- checkpointSeq >= jCheckpointEvery {
+            _ = journalCheckpoint(upto: lastAppliedSeq)  // failure is non-fatal
+        }
+        return true
+    }
+
+    /// Marks every record up to `seq` as applied by rewriting the journal
+    /// superblock. Cheap because records apply synchronously at commit time.
+    private static func journalCheckpoint(upto seq: UInt32) -> Bool {
+        var i = 0
+        while i < 512 { jSuperBuf[i] = 0; i += 1 }
+        setU32(&jSuperBuf, 0, jMagicSuper)
+        setU32(&jSuperBuf, 4, seq)
+        setU32(&jSuperBuf, 8, fnv1a(jSuperBuf, 0, 8))
+        guard writeSectors(UInt64(journalStart), 1, jSuperBuf) else {
+            klog("[fs] journal checkpoint write failed (non-fatal)")
+            return false
+        }
+        checkpointSeq = seq
+        return true
+    }
+
+    /// Mount-time recovery: read the journal superblock, validate every slot
+    /// (magic + checksums + seq match = committed), and redo the committed
+    /// records newer than the checkpoint in ascending seq order. A torn or
+    /// stale record simply fails validation and is skipped; the circular
+    /// slot mapping (slot = seq % slots) means the valid slots are always a
+    /// contiguous tail of the sequence, so ascending replay is newest-wins
+    /// for any sector journaled more than once. Ends by folding everything
+    /// into a fresh checkpoint and re-arming the sequence counter.
+    private static func journalRecover() {
+        checkpointSeq = 0
+        nextSeq = 1
+        lastAppliedSeq = 0
+        var highestSeq: UInt32 = 0
+        if let jsb = readSectors(UInt64(journalStart), 1),
+           getU32(jsb, 0) == jMagicSuper, getU32(jsb, 8) == fnv1a(jsb, 0, 8) {
+            checkpointSeq = getU32(jsb, 4)
+        } else {
+            klog("[fs] journal superblock unreadable — replaying from seq 1")
+        }
+
+        var pending: [(seq: UInt32, lba: UInt64, data: [UInt8])] = []
+        var slot = 0
+        while slot < journalSlots {
+            let base = UInt64(journalStart) + 1 + UInt64(slot * 3)
+            if let hdr = readSectors(base + 1, 1),
+               getU32(hdr, 0) == jMagicHeader, getU32(hdr, 20) == fnv1a(hdr, 0, 20) {
+                let seq = getU32(hdr, 4)
+                if let cmt = readSectors(base + 2, 1),
+                   getU32(cmt, 0) == jMagicCommit, getU32(cmt, 4) == seq,
+                   getU32(cmt, 8) == fnv1a(cmt, 0, 8),
+                   let payload = readSectors(base, 1),
+                   getU32(hdr, 16) == fnv1a(payload, 0, 512) {
+                    if seq > highestSeq { highestSeq = seq }
+                    let lba = getU64(hdr, 8)
+                    if seq > checkpointSeq, lba + 1 <= BlockDev.blockCount {
+                        pending.append((seq, lba, payload))
+                    }
+                }
+            }
+            slot += 1
+        }
+
+        if pending.isEmpty {
+            klog("[fs] journal: clean")
+        } else {
+                pending.sort { a, b in a.seq < b.seq }
+                var applied = 0
+                for rec in pending {
+                    if writeSectors(rec.lba, 1, rec.data) {
+                        applied += 1
+                    } else {
+                        klog("[fs] journal replay: sector \(rec.lba) write FAILED")
+                    }
+                }
+            klog("[fs] journal replayed \(applied) records")
+        }
+
+        nextSeq = (highestSeq > checkpointSeq ? highestSeq : checkpointSeq) &+ 1
+        if nextSeq == 0 { nextSeq = 1 }
+        lastAppliedSeq = nextSeq &- 1
+        _ = journalCheckpoint(upto: lastAppliedSeq)
+    }
+
+    /// FNV-1a 32 over a byte slice — cheap, allocation-free, good enough to
+    /// detect torn journal sectors (this is integrity, not security).
+    private static func fnv1a(_ buf: [UInt8], _ off: Int, _ count: Int) -> UInt32 {
+        var h: UInt32 = 0x811C_9DC5
+        var i = 0
+        while i < count {
+            h = (h ^ UInt32(buf[off + i])) &* 0x0100_0193
+            i += 1
+        }
+        return h
     }
 
     // MARK: - Sector I/O helpers

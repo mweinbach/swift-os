@@ -1,47 +1,67 @@
 // PL011 UART driver (QEMU virt: UART0 at 0x0900_0000) + kernel logging.
 
-private enum PL011 {
-    static let base: UInt = 0x0900_0000
-    static let dr    = base + 0x00
-    static let fr    = base + 0x18
-    static let ibrd  = base + 0x24
-    static let fbrd  = base + 0x28
-    static let lcrh  = base + 0x2C
-    static let cr    = base + 0x30
-}
-
 enum UART {
+    /// PL011 base address. Starts at the compiled-in QEMU virt default so
+    /// the very first boot output works; Machine.discover() re-points (and
+    /// re-initializes) it when the device tree names a different pl011.
+    /// Written only on the BSP during boot; read-only afterwards.
+    static private(set) var base: UInt = 0x0900_0000
+
+    // Register offsets from the PL011 base.
+    private enum PL011 {
+        static let drOff: UInt    = 0x00
+        static let frOff: UInt    = 0x18
+        static let ibrdOff: UInt  = 0x24
+        static let fbrdOff: UInt  = 0x28
+        static let lcrhOff: UInt  = 0x2C
+        static let crOff: UInt    = 0x30
+    }
+    private static var dr: UInt    { base + PL011.drOff }
+    private static var fr: UInt    { base + PL011.frOff }
+    private static var ibrd: UInt  { base + PL011.ibrdOff }
+    private static var fbrd: UInt  { base + PL011.fbrdOff }
+    private static var lcrh: UInt  { base + PL011.lcrhOff }
+    private static var cr: UInt    { base + PL011.crOff }
+
     /// Bytes dropped because the TX FIFO stayed full past the poll cap —
     /// i.e. the host end of the serial line stopped draining. Logging must
     /// never wedge the kernel, so a stalled FIFO costs bytes, not the boot.
     static private(set) var droppedTx: Int = 0
 
     static func initUART() {
-        mmioWrite32(PL011.cr, 0)                    // disable
-        mmioWrite32(PL011.ibrd, 13)                 // 24 MHz / (16 * 115200) = 13.02
-        mmioWrite32(PL011.fbrd, 1)
-        mmioWrite32(PL011.lcrh, (0b11 << 5) | (1 << 4)) // 8n1, FIFOs on
-        mmioWrite32(PL011.cr, 0x301)                // UARTEN | TXE | RXE
+        mmioWrite32(cr, 0)                    // disable
+        mmioWrite32(ibrd, 13)                 // 24 MHz / (16 * 115200) = 13.02
+        mmioWrite32(fbrd, 1)
+        mmioWrite32(lcrh, (0b11 << 5) | (1 << 4)) // 8n1, FIFOs on
+        mmioWrite32(cr, 0x301)                // UARTEN | TXE | RXE
+    }
+
+    /// Point the UART at a different PL011 base and re-initialize it there.
+    /// No-op when the base is unchanged (QEMU virt: always the default).
+    static func setBase(_ newBase: UInt) {
+        guard newBase != base else { return }
+        base = newBase
+        initUART()
     }
 
     static func putc(_ c: UInt8) {
         // Bounded wait on TXFF: if the host serial stops draining, drop the
         // byte and count it instead of spinning forever (panic paths too).
         var spins = 0
-        while mmioRead32(PL011.fr) & (1 << 5) != 0 { // TXFF
+        while mmioRead32(fr) & (1 << 5) != 0 { // TXFF
             spins += 1
             if spins >= 1_000_000 {
                 droppedTx += 1
                 return
             }
         }
-        mmioWrite32(PL011.dr, UInt32(c))
+        mmioWrite32(dr, UInt32(c))
     }
 
     /// Non-blocking: returns nil when the RX FIFO is empty.
     static func getc() -> UInt8? {
-        if mmioRead32(PL011.fr) & (1 << 4) != 0 { return nil } // RXFE
-        return UInt8(mmioRead32(PL011.dr) & 0xFF)
+        if mmioRead32(fr) & (1 << 4) != 0 { return nil } // RXFE
+        return UInt8(mmioRead32(dr) & 0xFF)
     }
 
     static func write(_ s: String) {

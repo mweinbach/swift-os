@@ -49,16 +49,35 @@ NO locks at all.
   UART serial keys → `OSEvent`), `VirtioBlk.swift` (`BlockDev`: virtio-mmio
   legacy block device, synchronous polled 512B sector I/O), `SwiftFS.swift`
   (our own simple persistent filesystem on BlockDev: superblock + 256 inodes
-  + block bitmap, 4 KiB contiguous spans, write-through), `Tasks.swift` (task
+  + block bitmap, 4 KiB contiguous spans, write-through, plus a 64-sector
+  metadata journal — sector-level physical redo: every inode/bitmap sector
+  goes to the journal first (payload → header → commit marker), then to its
+  real location; mount replays committed-but-unapplied records; all file
+  content writes are copy-on-write with a single journaled inode flip, so a
+  power cut leaves every file fully old or fully new. Legacy pre-journal
+  images mount in journaled-off mode, logged; new formats get the journal —
+  superblock +44/+48 journalStart/journalSectors, magic still SWFS0001), `Tasks.swift` (task
   registry/CPU accounting), `Power.swift` + `PSCI.S` (PSCI 0.2 SYSTEM_OFF /
   SYSTEM_RESET over `hvc #0` — QEMU virt has no EL3 by default, so the DTB
   conduit is HVC, not SMC; QEMU exits 0 on shutdown, and on reset when
   started with `-no-reboot`), `Userspace.swift` + `Userspace.S` (EL0 userspace:
-  runs an embedded unprivileged blob and services its `svc #0` ABI —
-  0=write(fd 1, captured) 1=uptime_ms 2=exit 3=yield; gated by
-  `Config.enableUserland`; lower-EL vector rows in `Vectors.S` route SVCs and
-  EL0-preempting IRQs), `KernelServices.swift` (the `Platform.services`
-  seam), `Support.swift` (libc/runtime shims), `Config.swift`.
+  the legacy synchronous `runDemo()` blob run (identity-mapped pages,
+  unchanged) AND scheduled user processes — `UserProcess.spawn(blob:)`
+  starts the blob as a real preemptible EL0 thread (`user<N>` in ps/top,
+  killable via `UserProcess.kill(pid:)`, migratable, SMP-concurrent), with
+  per-process L2/L3 maps installed in the running core's private L1
+  `userSlot` (9) by the scheduler's switch hook; the shared `svc #0` ABI —
+  0=write(fd 1, captured + UART mirror) 1=uptime_ms 2=exit 3=yield; exit
+  and faults terminate the thread via `Scheduler.exit()` from the sync
+  handler (contained, never a panic); gated by `Config.enableUserland`;
+  lower-EL vector rows in `Vectors.S` route SVCs and EL0-preempting IRQs),
+  `KernelServices.swift` (the `Platform.services`
+  seam), `Support.swift` (libc/runtime shims), `Config.swift` (compiled-in
+  fallback machine values), `DTB.swift` (`Machine`: FDT parser + machine
+  discovery — RAM size, cpu count, GIC/UART/fw-cfg bases, virtio-mmio
+  slots, psci method from the device tree QEMU leaves at the RAM base;
+  every field defaults to the old hardcoded value on any parse failure).
+  Drivers read `Machine.*`, never fresh hardcoded addresses.
 - `Userland/` — software compiled into the same module: `Geometry.swift`
   (Point/Size/Rect/Color, `CGFloat=Double`, CGRect aliases), `Events.swift`,
   `Surface.swift` (draw API **base class**), `Rasterizer.swift`
@@ -82,6 +101,16 @@ NO locks at all.
   (screenshot pixel checks), `--with-disk` (mounts a snapshot of
   build/disk.img, requires persistent storage online), `--soak N`
   (seeded-random command/key injection for N seconds), `--keep-qemu`.
+- `tools/fsck_swiftfs.py` — offline SwiftFS checker: parses superblock/inode
+  table/bitmap/journal, validates structure (parent links, reachability,
+  span overlap, bitmap cross-check — used-but-unreferenced blocks are
+  crash-window leaks, warnings only), and with `--expect ops.json` verifies
+  a known write burst: every file fully present with exact contents or fully
+  absent, executed ops form a prefix of sent ops.
+- `tools/journaltest.py` — SwiftFS journal fault-injection gate: boots QEMU,
+  injects a deterministic write/mkdir/mv burst, SIGKILLs mid-burst, offline
+  fsck, reboots, asserts journal replay + fsck again (3 cycles + legacy-image
+  phase). `--elf/--workdir` point at scratch builds.
 - `Host-macOS/` — the earlier macOS SwiftPM harness (Metal/AppKit app showing
   the same desktop). Secondary; the kernel is the product. (Renderer note:
   CTFontDrawGlyphs already draws upright with bitmap row 0 = visual top —
@@ -107,6 +136,14 @@ ANSI SGR colors in the terminal (colored ls/errors/grep), `kill`/`nano`/`top`,
 Ctrl+Alt+T opens a terminal / Ctrl+Alt+W closes a window / right-click desktop
 menu, and compositor frame skipping (idle desktop presents ~2 Hz; interactive
 frames draw immediately).
+
+Round-6 user processes: `urun` spawns the embedded blob as a SCHEDULED EL0
+user process (`user<N>` in ps/top, preemptible on any core, several at EL0
+simultaneously on different cores), `ukill <pid>` terminates it (pages, map
+and stack all freed); `udemo` still runs the same blob synchronously (short
+legacy mode — the blob picks long/short behaviour from the x0 run-mode
+argument). See the MMU hard-won note for the per-core L1[userSlot] design
+and the SP_EL0 save/restore rule.
 
 Toolchain pins: swiftc from `~/Library/Developer/Toolchains/swift-6.2-RELEASE.xctoolchain`,
 lld from `~/.swiftly/bin/ld.lld`, clang via `xcrun clang`. **Do not** use plain
@@ -173,7 +210,22 @@ splash eats keystrokes for ~12 s wall after "login session started".
 - QEMU virt addresses used: PL011 0x09000000, fw_cfg 0x09020000, GICD
   0x08000000 / GICC 0x08010000, virtio-mmio slots 0x0A000000+0x200 (legacy
   interface via `-global virtio-mmio.force-legacy=on`), RAM 0x40000000, kernel
-  loaded at 0x40080000, heap region 0x40800000–0x50000000.
+  loaded at 0x40200000, heap region 0x40800000–0x50000000. All of these are
+  now DISCOVERED from the device tree at boot (`Machine.discover`,
+  Kernel/DTB.swift); the values above live on as the compiled-in defaults.
+- **The DTB is NOT handed over in x0 for our ELF kernel** (QEMU
+  hw/arm/boot.c): x0=dtb only applies to raw Linux-protocol `-kernel`
+  images. ELF images take the bare-metal path — the CPU jumps straight to
+  `_start` with x0 = 0 and QEMU ROM-loads its generated FDT at the RAM
+  base 0x40000000, but ONLY if it fits below the kernel image. The FDT is
+  always padded to exactly 1 MiB, and the old 0x40080000 link address left
+  a 512 KiB gap, so the FDT was silently never loaded (arm_load_dtb returns
+  "0 as size, i.e., no error"). link.ld therefore links the kernel at
+  0x40200000; `Machine.discover` probes the RAM base when x0 is 0. Also:
+  `Machine.discover` runs before the heap AND the MMU — no allocation
+  (kprint family only, never klog) and NO multi-field struct returns/copies
+  (their vectorized copies alignment-fault with the MMU off — the parse
+  state lives in private static scalars).
 - The timer IRQ handler MUST save/restore SPSR_EL1/ELR_EL1 in its stack frame
   (Vectors.S) once context switches exist — otherwise a second IRQ on another
   thread erets to the wrong PC. This was a real bug; don't regress it.
@@ -192,6 +244,26 @@ splash eats keystrokes for ~12 s wall after "login session started".
   offsets 0-175, plus q0-q7 at 176-303, because NEON caller-saved regs were
   a preemption corruption hole). Keep the offsets 0-175 of the two frames
   identical.
+- Scheduled user processes (round 6) get PER-PROCESS page tables: L1 slot 9
+  (`MMU.userSlot`, VA 0x2_4000_0000) is the userspace gigabyte — every
+  process's blob+stack live at the SAME VAs there, translated by the
+  process's own L2/L3 (`MMU.makeUserMap`, only its two pages mapped —
+  everything else faults). Each core has a private L0/L1 pair (cpu 0 keeps
+  the boot tables; secondaries' clones are pre-built in `MMU.initMMU` and
+  installed by `MMU.useCoreTables` from `Scheduler.runCore`), so two
+  processes can be at EL0 simultaneously on two cores. The scheduler's
+  switch hook installs/clears the incoming thread's L2 in the core's
+  L1[9] + flushes the local TLB on EVERY switch where it differs (one
+  compare; kernel<->kernel switches skip it) — migration re-installs on
+  the new core automatically. AND: SP_EL0 is PER-CORE state, so the hook
+  also saves the outgoing user thread's SP_EL0 into its TCB and restores
+  the incoming one's — a thread resumed on a core that never dropped it
+  otherwise inherits garbage/leftover SP_EL0 and its next EL0 stack access
+  faults wildly (this was a real round-6 bug: level-0 translation fault in
+  the blob's stack-write subroutine). The reaper frees a user thread's
+  pages/L2/L3 only after runningOnCPU == -1, which (via the hook's
+  every-switch discipline) guarantees no core's L1[9] or TLB can still
+  translate them.
 - The compositor skips present when nothing changed (SoftwareSurface.drawCalls
   + events + cursor position, 500ms staleness cap) — idle uses ~70x less CPU;
   interactive latency is one tick. Under QEMU TCG it still measures high CPU

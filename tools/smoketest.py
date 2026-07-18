@@ -8,6 +8,10 @@ Usage:
                                             # REQUIRE persistent storage to come online
     python3 tools/smoketest.py --soak 60    # after the batteries: 60 s of seeded random
                                             # command/key injection with liveness checks
+    python3 tools/smoketest.py --journal-cycle
+                                            # 2x: fresh disk copy -> mount -> write
+                                            # burst -> SIGKILL mid-burst -> reboot ->
+                                            # assert mount + '[fs] journal' + clean log
     python3 tools/smoketest.py --keep-qemu  # leave the LAST pass's QEMU running
 
 What it does:
@@ -28,6 +32,15 @@ What it does:
      cpu 2 — so ordered needles would flake; the window check is
      order-free (and intentionally wider than the observed before-[fb]
      landing zone, so a straggler print can't flake either).
+     One more boot needle is OPTIONAL-BUT-CHECKED-WHEN-PRESENT: '[dtb] ram',
+     the round-6 DTB-discovery summary line. Absence never fails (trees
+     without the parser); when a boot emits it, its position before 'login
+     session started' is asserted and reported. Observed once the DTB agent
+     landed: line 2 of the boot log, BEFORE 'heap self-test ok' — promote
+     it to the front of the ordered list once that work settles (its shape
+     churned during landing, so it stays optional while in flight). It is
+     the ONLY absence-tolerant needle — every other pinned round-6 line is
+     asserted strictly where its feature is exercised.
      The socket uses `wait=on` (NOT the usual `wait=off`): the guest boots in
      well under a second and then goes quiet on serial, so with wait=off every
      boot byte is written before a client can possibly connect and is silently
@@ -51,23 +64,35 @@ What it does:
      already-formatted image, 'fresh image formatted and seeded' /
      'empty image reseeded' for a blank one (both mean write-through is
      live); any 'RAM-only' outcome fails.
-  5. Stress battery: ~34 more injected command lines, most of them
+  5. Stress battery: ~41 more injected command lines, most of them
      `;`-chained compounds (mkdir/echo/mv/cp/cat/rm loops, pipes, append
      redirection), plus the real workloads: ping -c 1 10.0.2.2 (twice, once
      after the filesystem churn), udemo (twice — EL0 re-entry), tree /,
      du -sh /, find /, man/which lookups, kill 9999/9998 (expect-safe
-     failures), the SMP block (smpdemo 3 -> ps with a 3 s settle ->
-     kill 9998 -> smpdemo 2 second round; smpdemo is the SMP shell agent's
-     pinned command — until it lands, the shell's unknown-command path is
-     equally expect-safe), and `top` followed 3 s later by a bare `q` to
-     exercise the terminal's interactive TOP mode entry/exit, then a final
-     `uptime` to prove the shell is responsive again (load averages are
-     visual only — never asserted; shell output goes to the GUI, not serial).
+     failures), the round-6 DNS/EL0 block (nslookup swift.org — a real DNS
+     answer over slirp, exercise-only, nothing asserted on serial;
+     host bogus.invalid — clean NXDOMAIN failure; urun — spawns an EL0
+     'user<N>' process; ps after a 3 s settle; ukill 9998 — expect-safe;
+     ping swift.org — resolve + timeout is the truthful outcome; all pinned
+     commands from the net/user-process agents, and equally expect-safe
+     command-not-found paths until they land), the SMP block (smpdemo 3 ->
+     ps with a 3 s settle -> kill 9998 -> smpdemo 2 second round; smpdemo is
+     the SMP shell agent's pinned command — until it lands, the shell's
+     unknown-command path is equally expect-safe), and `top` followed 3 s
+     later by a bare `q` to exercise the terminal's interactive TOP mode
+     entry/exit, then a final `uptime` to prove the shell is responsive
+     again (load averages are visual only — never asserted; shell output
+     goes to the GUI, not serial).
   6. Negative assertions across the WHOLE run (from the first boot byte to
      the last soak key): the serial log must not contain KERNEL PANIC,
      SYNC EXCEPTION, RECURSIVE FAULT, stack overflow in thread, CPU_ON
-     failed, [heap] bad free, heap validation FAILED, OUT OF MEMORY, or
-     SERROR — the offending line is quoted on failure.
+     failed, [heap] bad free, heap validation FAILED, OUT OF MEMORY,
+     SERROR, journal replay FAILED (FS journal, pinned round-6 line),
+     dtb: invalid magic (DTB parser, pinned round-6 line), L2 allocation
+     failed / L3 allocation failed (MMU table splits) — the offending line
+     is quoted on failure. Deliberately NOT a marker: 'user program
+     faulted' is the NORMAL EL0 containment outcome of udemo/urun fault
+     injection (a GUI-side result string, not a crash).
   7. --soak N: after the batteries, injects randomized-but-seeded command
      sequences plus arrow/escape key bytes for N seconds, asserting QEMU
      stays alive and no crash marker appears (liveness only — no serial
@@ -83,6 +108,19 @@ What it does:
      least a few rows (1px hairlines elsewhere don't count). The cocoa pass
      runs the same batteries (so the screenshots exercise real rendering),
      but not the soak.
+  9. --journal-cycle: SwiftFS crash-recovery gate, 2 cycles. Each cycle
+     snapshots the disk image fresh (a blank 32 MiB image when
+     build/disk.img is absent — the guest formats+seeds blanks itself),
+     boots it, forces the lazy mount with `ls /`, feeds a heavy write
+     burst, and SIGKILLs QEMU mid-burst (proc.kill — a power cut, no
+     shutdown path). It then reboots the SAME image and asserts: the mount
+     comes back online, a '[fs] journal' line is present (STRICT — the
+     pinned round-6 FS-journal line; that one record fails until the
+     journal agent lands, while the mount-success record beside it already
+     passes on the write-through kernel), and the whole reboot serial log
+     is free of crash markers ('journal replay FAILED' is one of them).
+     Journal-cycle QEMU instances are always stopped — --keep-qemu does
+     not apply to them.
 
 Stdlib only. Exit code 0 iff every assertion passes.
 """
@@ -107,6 +145,7 @@ DISK_IMG = os.path.join(BUILD, "disk.img")
 DISK_SNAPSHOT = os.path.join(BUILD, "smoke-disk.img")
 SOCK_HEADLESS = os.path.join(BUILD, "smoke.sock")
 SOCK_COCOA = os.path.join(BUILD, "smoke-cocoa.sock")
+SOCK_JOURNAL = os.path.join(BUILD, "smoke-journal.sock")
 SHOTS_DIR = os.path.join(BUILD, "smoke-shots")
 
 QEMU = "qemu-system-aarch64"
@@ -120,12 +159,17 @@ QEMU_BASE = [
     "-global", "virtio-mmio.force-legacy=on",
 ]
 
-# virtio-blk is appended only with --with-disk (probing is by device ID, so
-# slot order vs. the Makefile's layout doesn't matter).
-DISK_QEMU_ARGS = [
-    "-device", "virtio-blk-device,drive=hd0",
-    "-drive", f"file={DISK_SNAPSHOT},format=raw,if=none,id=hd0",
-]
+# virtio-blk is appended only for the --with-disk pass and the
+# --journal-cycle legs (probing is by device ID, so slot order vs. the
+# Makefile's layout doesn't matter).
+def disk_qemu_args(img_path):
+    return [
+        "-device", "virtio-blk-device,drive=hd0",
+        "-drive", f"file={img_path},format=raw,if=none,id=hd0",
+    ]
+
+
+DISK_QEMU_ARGS = disk_qemu_args(DISK_SNAPSHOT)
 
 # (needle, per-step timeout s) — asserted strictly in order. The order is the
 # real boot sequence in kmain: Heap -> Interrupts -> Scheduler -> Display ->
@@ -155,6 +199,19 @@ SMP_CPUS = (1, 2, 3)
 SMP_LINE_TEMPLATES = ("[smp] cpu {cpu} online",
                       "[smp] cpu {cpu} scheduling",
                       "[sched] cpu {cpu} online")
+
+# Round-6 DTB discovery (landing separately): the parser's '[dtb] ram'
+# summary line. It is checked-when-present (see check_dtb_window): when a
+# boot emits it, its position before 'login session started' is asserted
+# and reported; absence never fails. OBSERVED 2026-07-18 across 5 boots
+# once the DTB agent landed: line 2 of the boot log (after the '[dtb] no
+# DTB pointer in x0 ... probing RAM base' probe line, BEFORE the banner and
+# 'heap self-test ok') — promote it to the FRONT of BOOT_STEPS once the
+# DTB work settles (the line shape churned 3x during landing: '[probe]
+# dtb=...' -> '[dtb] no DTB pointer...' -> '[dtb] ram ...', so it is kept
+# optional while that agent is still in flight). The ONLY absence-tolerant
+# needle.
+DTB_RAM_NEEDLE = b"[dtb] ram"
 
 # Storage lines (Userland/VFS.swift Disk.initAndMount) — logged LAZILY on the
 # first VFS access, so asserted after the standard battery, not at boot.
@@ -212,6 +269,19 @@ STRESS_BATTERY = [
     ("ping", 2.5),                        # usage error path
     ("ping -c 1 10.0.2.2", 6.0),          # net stack still alive after FS churn
     ("udemo", 4.0),                       # EL0 re-entry
+    # --- Round-6 block: DNS over slirp + EL0 user processes. nslookup/host/
+    # ping-hostname are the net agent's pinned commands (DNS via slirp's
+    # 10.0.2.3 resolver; a resolved public host truthfully times out on
+    # ICMP), urun/ukill are the user-process agent's (spawns/kills 'user<N>'
+    # EL0 threads, visible to ps). Until those land, the shell's
+    # command-not-found path is equally expect-safe. GUI output only —
+    # nothing from this block is asserted on serial.
+    ("nslookup swift.org", 8.0),          # real DNS answer via slirp (exercise)
+    ("host bogus.invalid", 6.0),          # clean NXDOMAIN failure path
+    ("urun", 4.0),                        # spawn an EL0 user process ('user<N>')
+    ("ps", 3.0),                          # 3 s settle: user<N> visible to ps
+    ("ukill 9998", 2.5),                  # no such user pid — expect-safe
+    ("ping swift.org", 12.0),             # resolve OK + ICMP timeout is truth
     # --- SMP block: cross-core spin threads (smpdemo is the SMP shell
     # agent's pinned command; until it lands the shell's unknown-command
     # path is equally expect-safe). Spin pids can't be known ahead, so the
@@ -242,6 +312,9 @@ SOAK_KEYS = [b"\x1b[A", b"\x1b[B", b"\x1b[C", b"\x1b[D", b"\x1b", b"\x7f", b"\t"
 SOAK_SEED = 0x51F7
 
 # Crash signatures that must NOT appear on serial across the whole run.
+# Deliberately NOT here: "user program faulted" (Kernel/Userspace.swift) is
+# the NORMAL EL0 containment outcome of udemo/urun fault injection — a
+# GUI-side result string, never a crash.
 PANIC_MARKERS = [
     b"KERNEL PANIC",
     b"SYNC EXCEPTION",
@@ -252,6 +325,15 @@ PANIC_MARKERS = [
     b"heap validation FAILED",
     b"OUT OF MEMORY",
     b"SERROR",
+    # Round-6 additions. The journal/dtb strings are pinned lines of agents
+    # landing in parallel — unobservable on a tree without those features,
+    # where a never-appearing marker is harmless; if one ever appears, the
+    # gate must trip. The MMU strings cover the page-table split failures
+    # ("L3 allocation failed" is the observed allowEL0 log).
+    b"journal replay FAILED",      # FS journal: replay after unclean shutdown
+    b"dtb: invalid magic",         # DTB parser: corrupt firmware table
+    b"L2 allocation failed",       # MMU page-table split (pinned string)
+    b"L3 allocation failed",       # MMU allowEL0 split (observed string)
 ]
 
 CONNECT_TIMEOUT = 30.0
@@ -556,6 +638,7 @@ def boot_pass(tag, display, sock_path, extra_args=(), with_disk=False):
             login_idx = idx
         pos = idx + len(needle)
     check_smp_window(tag, pump, sched_pos, login_idx)
+    check_dtb_window(tag, pump, login_idx)
     return True, proc, sock, pump, logf, pos
 
 
@@ -575,6 +658,26 @@ def check_smp_window(tag, pump, from_pos, to_pos):
                   else f"window has: {smp_lines or 'no [smp] lines at all'}")
         record(f"{tag}: smp cpu {cpu} up (online|scheduling line before login)",
                hit is not None, detail)
+
+
+def check_dtb_window(tag, pump, login_idx):
+    """Optional-but-checked-when-present DTB needle (see DTB_RAM_NEEDLE).
+    Runs after the ordered boot loop, so the whole boot log is already in
+    the buffer. Absence passes (parser not landed); presence must land
+    before 'login session started' and is reported with its byte position
+    so the needle can later be promoted into BOOT_STEPS."""
+    idx = pump.buf.find(DTB_RAM_NEEDLE)
+    if idx < 0:
+        record(f"{tag}: '[dtb] ram' (optional — checked when present)", True,
+               "not emitted by this kernel (DTB parser not landed yet)")
+        return
+    start = pump.buf.rfind(b"\n", 0, idx) + 1
+    end = pump.buf.find(b"\n", idx)
+    line = pump.buf[start:end if end >= 0 else len(pump.buf)].decode(errors="replace").strip()
+    ok = idx < login_idx
+    record(f"{tag}: '[dtb] ram' (optional — checked when present)", ok,
+           f"at byte {idx} (login at {login_idx}): '{line}'"
+           + ("" if ok else " — lands AFTER login, cannot promote into BOOT_STEPS"))
 
 
 def inject_lines(tag, proc, sock, pump, lines, label):
@@ -711,6 +814,191 @@ def run_soak(tag, proc, sock, pump, seconds):
                   else f"alive={alive} crash={crash}")
     record(f"{tag}: soak {seconds:.0f}s survived", ok,
            f"{n_cmds} commands, {n_keys} key bursts — {detail}")
+
+
+# --------------------------------------------------------------------------
+# --journal-cycle: SwiftFS crash-recovery gate (kill -9 mid-write, remount)
+# --------------------------------------------------------------------------
+
+JOURNAL_CYCLES = 2
+JOURNAL_NEEDLE = b"[fs] journal"
+JOURNAL_KILL_AFTER_S = 1.2   # SIGKILL this far into the write burst
+JOURNAL_BURST_GAP_S = 0.25   # pacing between fed burst lines
+JOURNAL_MOUNT_WAIT_S = 30.0  # lazy mount must answer within this after 'ls /'
+
+
+def journal_burst(cycle):
+    """Heavy write compounds for the kill leg: ~7 VFS mutations per line, all
+    under a per-cycle tree. Distinct paths per cycle keep the cycles
+    independent even when the base image is shared."""
+    lines = []
+    for i in range(10):
+        d = f"/tmp/jcyc{cycle}d{i}"
+        lines.append(f"mkdir {d}; echo c{cycle}i{i}a > {d}/a; echo c{cycle}i{i}b > {d}/b; "
+                     f"cp {d}/a {d}/c; mv {d}/b {d}/e; cat {d}/a; ls {d}")
+    return lines
+
+
+def fresh_cycle_disk(cycle):
+    """A FRESH blank 32 MiB image for the journal kill-cycle. Always blank:
+    a journaled SwiftFS only exists on newly formatted images — a snapshot of
+    build/disk.img is a LEGACY image (no journal region) and would boot the
+    journal-less compatibility mode, making the cycle meaningless. (The
+    legacy path is covered separately by --with-disk.) The guest
+    formats+seeds blanks itself — same as `make disk`."""
+    img = os.path.join(BUILD, f"journal-cycle-{cycle}.img")
+    try:
+        with open(img, "wb") as fh:
+            fh.truncate(32 * 1024 * 1024)
+    except OSError as exc:
+        return None, f"cannot create blank image: {exc}"
+    return img, "blank 32MiB (guest will format+seed with journal)"
+
+
+def wait_storage_online(pump, timeout):
+    """Poll for the lazy mount's serial line after a VFS-touching command.
+    True = storage came online (persistent / fresh / reseeded — or, once the
+    FS journal lands, a '[fs] journal' mount line). False = RAM-only, QEMU
+    died, or timeout."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        buf = bytes(pump.buf)
+        if (buf.find(STORAGE_ONLINE) >= 0
+                or any(buf.find(a) >= 0 for a in STORAGE_ONLINE_ALTS)
+                or buf.find(JOURNAL_NEEDLE) >= 0):
+            return True
+        if buf.find(STORAGE_RAM_ONLY) >= 0:
+            return False
+        if pump.eof or pump.proc.poll() is not None:
+            return False
+        pump.pump()
+        time.sleep(0.05)
+    return False
+
+
+def quote_storage_line(pump):
+    """The most recent [disk]/[fs] storage line in the capture, for detail
+    strings ('' when the lazy mount never logged)."""
+    buf = bytes(pump.buf)
+    at = max(buf.rfind(b"[disk]"), buf.rfind(b"[fs]"))
+    if at < 0:
+        return ""
+    end = buf.find(b"\n", at)
+    return buf[at:end if end >= 0 else len(buf)].decode(errors="replace").strip()
+
+
+def journal_leg_killed(tag, img, cycle):
+    """Leg 1: boot `img`, force the lazy mount, feed the write burst, then
+    SIGKILL QEMU mid-burst (a power cut — no shutdown path). True when the
+    cycle should proceed to the recover leg."""
+    ok, proc, sock, pump, logf, _ = boot_pass(
+        f"{tag}-kill", "none", SOCK_JOURNAL, extra_args=disk_qemu_args(img))
+    try:
+        if not ok:
+            return False
+        pump.drain_for(SPLASH_SETTLE_S)
+        # Force the lazy mount BEFORE the burst so burst writes hit the disk,
+        # not a RAM-only VFS.
+        try:
+            sock.sendall(b"ls /\n")
+        except OSError as exc:
+            record(f"{tag}: leg-1 mount before burst", False, f"send failed: {exc}")
+            return False
+        mounted = wait_storage_online(pump, JOURNAL_MOUNT_WAIT_S)
+        record(f"{tag}: leg-1 mount before burst", mounted,
+               quote_storage_line(pump) or "no storage line after 'ls /'")
+        if not mounted:
+            return False
+        # Feed heavy compounds, then SIGKILL while the shell is still working
+        # through them (one full line takes ~2-4 s under TCG, so a kill ~1.2 s
+        # into a fed burst always lands mid-write).
+        t0 = time.monotonic()
+        sent = 0
+        try:
+            for line in journal_burst(cycle):
+                sock.sendall(line.encode() + b"\n")
+                sent += 1
+                pump.drain_for(JOURNAL_BURST_GAP_S)
+                if time.monotonic() - t0 >= JOURNAL_KILL_AFTER_S:
+                    break
+        except OSError:
+            pass  # socket dying with the process is fine — we're killing it
+        proc.kill()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            record(f"{tag}: QEMU killed -9 mid-burst", False,
+                   "SIGKILL did not reap QEMU")
+            return False
+        record(f"{tag}: QEMU killed -9 mid-burst", True,
+               f"{sent} burst lines fed, killed {time.monotonic() - t0:.1f}s into "
+               f"the burst, qemu exit {proc.returncode}")
+        crash = pump.has_crash_since(0)
+        record(f"{tag}: leg-1 serial clean until kill", crash is None,
+               crash or "no crash markers before SIGKILL")
+        return True
+    finally:
+        save_serial(f"{tag}-kill", pump)
+        stop_qemu(proc, sock, logf, keep=False)
+
+
+def journal_leg_recover(tag, img, cycle):
+    """Leg 2: reboot the SAME (killed) image. Asserts: mount comes back after
+    the unclean shutdown, the pinned '[fs] journal' line is present (STRICT —
+    fails until the FS-journal agent lands), and the whole reboot serial is
+    free of crash markers ('journal replay FAILED' among them)."""
+    ok, proc, sock, pump, logf, _ = boot_pass(
+        f"{tag}-recover", "none", SOCK_JOURNAL, extra_args=disk_qemu_args(img))
+    try:
+        if not ok:
+            return
+        pump.drain_for(SPLASH_SETTLE_S)
+        try:
+            sock.sendall(b"ls /\n")  # force the lazy mount
+        except OSError as exc:
+            record(f"{tag}: post-kill mount succeeds", False, f"send failed: {exc}")
+            return
+        mounted = wait_storage_online(pump, JOURNAL_MOUNT_WAIT_S)
+        record(f"{tag}: post-kill mount succeeds", mounted,
+               quote_storage_line(pump) or "no storage line after 'ls /'")
+        # Strict pinned needle. The journal mount/replay line is logged AT
+        # mount, so by the time the mount answered it is already in the
+        # buffer — no extra wait.
+        buf = bytes(pump.buf)
+        jidx = buf.find(JOURNAL_NEEDLE)
+        if jidx >= 0:
+            start = buf.rfind(b"\n", 0, jidx) + 1
+            end = buf.find(b"\n", jidx)
+            detail = buf[start:end if end >= 0 else len(buf)].decode(errors="replace").strip()
+        else:
+            detail = ("not emitted — FS journal not landed on this tree; "
+                      f"mount said: {quote_storage_line(pump) or '<nothing>'}")
+        record(f"{tag}: '[fs] journal' line after kill -9", jidx >= 0, detail)
+        alive = proc.poll() is None and not pump.eof
+        crash = pump.has_crash_since(0)
+        record(f"{tag}: reboot serial clean, qemu alive", alive and crash is None,
+               "qemu alive, no crash markers" if (alive and crash is None)
+               else f"alive={alive} crash={crash}")
+    finally:
+        save_serial(f"{tag}-recover", pump)
+        stop_qemu(proc, sock, logf, keep=False)
+
+
+def journal_cycle_pass():
+    """--journal-cycle: JOURNAL_CYCLES independent kill/remount cycles, each
+    from a fresh copy of the disk image (see module docstring point 9)."""
+    for cycle in range(1, JOURNAL_CYCLES + 1):
+        tag = f"journal{cycle}"
+        img, how = fresh_cycle_disk(cycle)
+        if img is None:
+            record(f"{tag}: fresh disk copy", False, how)
+            continue
+        record(f"{tag}: fresh disk copy", True, how)
+        if journal_leg_killed(tag, img, cycle):
+            journal_leg_recover(tag, img, cycle)
+        else:
+            record(f"{tag}: cycle {cycle} recover leg", False,
+                   "skipped — kill leg did not complete cleanly")
 
 
 # --------------------------------------------------------------------------
@@ -980,8 +1268,15 @@ def main():
     ap.add_argument("--soak", type=float, default=0.0, metavar="SECONDS",
                     help="after the batteries: seeded-random command/key injection "
                          "for SECONDS with liveness assertions, then a final 'uptime'")
+    ap.add_argument("--journal-cycle", action="store_true",
+                    help="SwiftFS crash-recovery gate (2 cycles): boot a fresh copy "
+                         "of the disk image, force the mount, inject a write burst, "
+                         "kill QEMU -9 mid-burst, reboot the SAME image and assert "
+                         "mount + a '[fs] journal' line + clean serial. Strict on "
+                         "the journal line: fails until the FS-journal agent lands")
     ap.add_argument("--keep-qemu", action="store_true",
-                    help="leave the LAST pass's QEMU running")
+                    help="leave the LAST pass's QEMU running "
+                         "(journal-cycle legs are always stopped)")
     args = ap.parse_args()
 
     t0 = time.monotonic()
@@ -1023,6 +1318,13 @@ def main():
                 cocoa_pass(keep=args.keep_qemu, with_disk=args.with_disk)
             else:
                 record("cocoa: pass", False, "skipped — headless boot failed")
+
+        # --- journal crash-recovery cycles ---------------------------------
+        if args.journal_cycle:
+            if ok:
+                journal_cycle_pass()
+            else:
+                record("journal: pass", False, "skipped — headless boot failed")
 
     n_pass = sum(1 for _, ok, _ in results if ok)
     n_fail = sum(1 for _, ok, _ in results if not ok)

@@ -1,5 +1,7 @@
 // GICv2 + ARM generic timer: exception vectors, IRQ dispatch, 100 Hz tick.
-// QEMU virt: GICD at 0x0800_0000, GICC at 0x0801_0000. The EL1 physical
+// QEMU virt: GICD at 0x0800_0000, GICC at 0x0801_0000 — discovered from the
+// device tree at boot (Machine.gicdBase/giccBase, Kernel/DTB.swift); those
+// hardcoded values live on as the compiled-in defaults. The EL1 physical
 // timer (CNTP_*) is PPI 30 (INTID 30); SPIs start at 32. SGI 1 is reserved
 // as the panic-halt IPI (see Kernel/Panic.swift and the SGI-1 check in
 // Vectors.S' irq_entry).
@@ -23,19 +25,20 @@ enum Interrupts {
     /// Scheduler, not here.
     static private(set) var tickCount: UInt64 = 0
 
-    /// GICv2 register map.
+    /// GICv2 register map. Bases come from the device tree (Machine.*);
+    /// the defaults are QEMU virt's 0x0800_0000 / 0x0801_0000.
     private enum GIC {
-        static let distBase: UInt = 0x0800_0000
-        static let cpuBase:  UInt = 0x0801_0000
+        static var distBase: UInt { Machine.gicdBase }
+        static var cpuBase:  UInt { Machine.giccBase }
 
-        static let dCtlr       = distBase + 0x000   // GICD_CTLR
-        static let dISENABLER  = distBase + 0x100   // +4 per 32 interrupt IDs
-        static let dIPRIORITYR = distBase + 0x400   // +4 per 4 IDs (byte fields)
-        static let dITARGETSR  = distBase + 0x800   // +4 per 4 IDs, SPIs only
+        static var dCtlr: UInt       { distBase + 0x000 }   // GICD_CTLR
+        static var dISENABLER: UInt  { distBase + 0x100 }   // +4 per 32 interrupt IDs
+        static var dIPRIORITYR: UInt { distBase + 0x400 }   // +4 per 4 IDs (byte fields)
+        static var dITARGETSR: UInt  { distBase + 0x800 }   // +4 per 4 IDs, SPIs only
 
-        static let cCtlr = cpuBase + 0x000          // GICC_CTLR
-        static let cPMR  = cpuBase + 0x004          // GICC_PMR
-        static let cEOIR = cpuBase + 0x010          // GICC_EOIR
+        static var cCtlr: UInt { cpuBase + 0x000 }          // GICC_CTLR
+        static var cPMR: UInt  { cpuBase + 0x004 }          // GICC_PMR
+        static var cEOIR: UInt { cpuBase + 0x010 }          // GICC_EOIR
     }
 
     /// EL1 physical timer PPI on the virt GIC.

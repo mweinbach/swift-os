@@ -14,6 +14,9 @@
 //     L1[1]  -> L2 table (the RAM gigabyte, split into 2 MiB slots so a
 //              slot hosting EL0 pages can later be refined to 4 KiB
 //              granularity — see allowEL0 below)
+//     L1[9]  -> the core's ACTIVE scheduled-user-process L2 (per-core —
+//              see "per-core roots" below; invalid while a kernel thread
+//              runs on the core). This is the ONLY per-core entry.
 //     rest   = invalid
 //   L2 (1 page, 512 entries):
 //     L2[i]  = 2 MiB block [0x4000_0000 + i*2MiB, +2MiB)
@@ -21,6 +24,13 @@
 //              (MAIR attr1), EL1-only RW — covers all 512 MiB of RAM plus
 //              kernel/heap. Identical attrs to the former 1 GiB L1 block:
 //              same translation, one extra walk level.
+//   Per-core roots: cpu 0 runs on the boot L0/L1; each secondary gets a
+//     clone (L0[0] -> private L1 copy, installed via useCoreTables from
+//     Scheduler.runCore) so that L1[userSlot] — the scheduled user
+//     process's private L2 — is PER-CORE. That is what lets two different
+//     EL0 processes run simultaneously on two cores: same user VAs,
+//     different physical pages, no shared-table contention. See the
+//     perCoreL0 docs and Kernel/Userspace.swift.
 //   L3 (1 page, allocated on demand — one per L2 slot that hosts EL0 pages):
 //     allowEL0 replaces the slot's L2 block descriptor with a pointer to a
 //     fresh L3 table holding 512 x 4 KiB page descriptors that inherit the
@@ -89,6 +99,38 @@ enum MMU {
     /// trip over anyway.
     private static var l2Tables = [UInt](repeating: 0, count: 8)
 
+    // MARK: Scheduled user processes (per-core user maps)
+    //
+    // L1 slot dedicated to the EL0 user window of the SCHEDULED user
+    // process currently running on each core (UserProcess.spawn — see
+    // Kernel/Userspace.swift; the legacy synchronous runDemo keeps using
+    // identity-mapped pages via allowEL0 and never touches this slot).
+    // Every user process shares one VA layout — blob at userWinBase, stack
+    // page at userWinBase+4 KiB — and gets its own private L2 table
+    // holding exactly those mappings, so the same VAs name different
+    // physical pages for different processes. With 8 GiB of RAM mapped in
+    // L1[1..8], slot 9 (9 GiB, 0x2_4000_0000) is the first free one.
+    static let userSlot = 9
+    static let userWinBase: UInt = 0x2_4000_0000     // userSlot GiB
+    /// Per-process window span: one blob page + one stack page (4 KiB each).
+    static let userWinSpan: UInt = 8192
+
+    /// Per-core page-table roots, pre-built on the BSP in initMMU (no
+    /// lazy-static first touch from secondaries). Entry 0 is the boot
+    /// L0/L1 pair itself; entries 1..cpuCount-1 are clones: L0[0] -> a
+    /// private L1 whose entries copy the BSP's (device block + pointers to
+    /// the SAME shared RAM L2 tables — kernel translations are identical
+    /// on every core, and later kernel-L2 slot splits via allowEL0 are
+    /// seen by all) except L1[userSlot], which is PER-CORE: it points at
+    /// the L2 table of the user process currently scheduled on that core
+    /// (invalid while a kernel thread runs). Per-core L1s are what allow
+    /// two different user processes at EL0 SIMULTANEOUSLY on two cores —
+    /// a single shared L1 could hold only one core's user map. Secondaries
+    /// install their pair via useCoreTables (from Scheduler.runCore);
+    /// switchUserMap flips the per-core user slot on thread switches.
+    private static var perCoreL0 = [UInt](repeating: 0, count: Config.cpuCount)
+    private static var perCoreL1 = [UInt](repeating: 0, count: Config.cpuCount)
+
     /// Build the identity map and enable the MMU + I/D caches.
     /// On any sanity failure: log, leave the MMU off, return false.
     static func initMMU() -> Bool {
@@ -136,6 +178,34 @@ enum MMU {
             putDesc(l1, gb + 1, UInt64(l2) | descTable)
             l2Tables[gb] = l2
             gb &+= 1
+        }
+
+        // Per-core roots (see the perCoreL0 docs above): cpu 0 keeps the
+        // boot pair; every secondary gets a clone. Built here, on the BSP —
+        // secondaries only write TTBR0 (useCoreTables), they never allocate
+        // or first-touch these statics. A clone's L1 copies the BSP's
+        // wholesale, so it sees the device block and the same shared RAM L2
+        // tables; L1[userSlot] stays zero (no user map) until that core
+        // schedules a user thread.
+        perCoreL0[0] = l0
+        perCoreL1[0] = l1
+        var cpu = 1
+        while cpu < Config.cpuCount {
+            guard let cl0 = KernelHeap.allocPages(1), let cl1 = KernelHeap.allocPages(1),
+                  cl0 & 0xFFF == 0, cl1 & 0xFFF == 0 else {
+                klog("[mmu] per-core table allocation failed, MMU stays off")
+                return false
+            }
+            zeroPage(cl0)
+            var e = 0
+            while e < 512 {
+                putDesc(cl1, e, loadDesc(l1, e))
+                e &+= 1
+            }
+            putDesc(cl0, 0, UInt64(cl1) | descTable)
+            perCoreL0[cpu] = cl0
+            perCoreL1[cpu] = cl1
+            cpu &+= 1
         }
 
         // Program the translation regime before enabling it.
@@ -237,6 +307,65 @@ enum MMU {
         kprint(" .. ")
         kprintHex(UInt64(base + byteCount))
         kprint(" (4 KiB page granularity)\n")
+    }
+
+    // MARK: - Scheduled user processes: per-core user maps
+
+    /// True when the MMU was initialized (identity map live). Scheduled
+    /// user processes REQUIRE it: their code runs at userWinBase VAs that
+    /// exist only inside per-process L2 windows — with translation off
+    /// those addresses are beyond the RAM map entirely.
+    static var isOn: Bool { l2Tables[0] != 0 }
+
+    /// Point this core's TTBR0_EL1 at its private L0/L1 pair (pre-built in
+    /// initMMU). Secondaries call this once from Scheduler.runCore, after
+    /// the SMP bring-up replayed the BSP's translation sysregs; the private
+    /// L1 duplicates every kernel mapping, so the switch changes no
+    /// translation — it only gives the core its own L1[userSlot] to flip
+    /// when it later schedules user threads. Allocation- and lock-free
+    /// (tables pre-built, sysreg writes only): safe from any context.
+    /// No-op for unknown cpus or when the MMU was never initialized.
+    static func useCoreTables(cpu: Int) {
+        guard cpu >= 0, cpu < Config.cpuCount else { return }
+        let root = perCoreL0[cpu]
+        guard root != 0 else { return }
+        mmuWriteTTBR0(UInt64(root))
+        syncTables()
+    }
+
+    /// Install (or clear) this core's active user map: point L1[userSlot]
+    /// of the core's private L1 at the given per-process L2 table, or make
+    /// it invalid when `l2` is 0 (kernel thread current). Then flush this
+    /// core's TLB — load-bearing for isolation, not hygiene: stale entries
+    /// for the user window could otherwise keep translating a previous
+    /// process's VAs to pages that were freed and reused by someone else.
+    /// Per-core state only (the write touches no shared table, and
+    /// tlbi vmalle1 is local to this core), so concurrent installs on
+    /// other cores are unaffected. Allocation-free, takes no locks: legal
+    /// from the scheduler's switch path (Locks.sched held, IRQ context).
+    static func switchUserMap(cpu: Int, l2: UInt) {
+        guard cpu >= 0, cpu < Config.cpuCount else { return }
+        let l1 = perCoreL1[cpu]
+        guard l1 != 0 else { return }
+        putDesc(l1, userSlot, l2 != 0 ? (UInt64(l2) | descTable) : 0)
+        syncTables()
+    }
+
+    /// Build a per-process user map in two caller-supplied, already-zeroed
+    /// pages: `l2` gets a single table descriptor at slot 0 pointing at
+    /// `l3`; `l3` maps exactly two 4 KiB pages at the bottom of the user
+    /// window — page 0 = blobPA (code + data: EL0+EL1 RW, PXN so the
+    /// kernel can never execute a user-writable page, UXN clear so EL0
+    /// can), page 1 = stackPA (same, plus UXN: the stack is never code).
+    /// Every other entry stays invalid, so any EL0 access outside its two
+    /// pages is a translation fault contained as a user-program fault.
+    /// No TLB maintenance here: nothing has ever walked these VAs through
+    /// this table; the installing switchUserMap flushes. Pure descriptor
+    /// writes — allocation- and lock-free.
+    static func makeUserMap(l2: UInt, l3: UInt, blobPA: UInt, stackPA: UInt) {
+        putDesc(l2, 0, UInt64(l3) | descTable)
+        putDesc(l3, 0, UInt64(blobPA) | af | shInner | attrIndx1 | apEL0 | pxn | descPage)
+        putDesc(l3, 1, UInt64(stackPA) | af | shInner | attrIndx1 | apEL0 | pxn | uxn | descPage)
     }
 
     /// Split slot `slot` of the RAM L2 table into 512 x 4 KiB L3 pages and

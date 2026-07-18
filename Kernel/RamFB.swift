@@ -25,13 +25,14 @@ enum Display {
     private static var fbAddr: UInt = 0
     private static var backAddr: UInt = 0
 
-    // fw_cfg MMIO registers (QEMU virt). NOTE: the selector and DMA
+    // fw_cfg MMIO registers (QEMU virt). Base from the device tree
+    // (Machine.fwCfgBase; default 0x0902_0000). NOTE: the selector and DMA
     // registers are DEVICE_BIG_ENDIAN — values must be byte-swapped on
     // write. (The data port is byte-oriented, so reads need no swap.)
     private enum FwCfg {
-        static let data: UInt     = 0x0902_0000
-        static let selector: UInt = 0x0902_0008
-        static let dma: UInt      = 0x0902_0010   // 64-bit BE: address of FWCfgDmaAccess
+        static var data: UInt     { Machine.fwCfgBase }
+        static var selector: UInt { Machine.fwCfgBase + 0x08 }
+        static var dma: UInt      { Machine.fwCfgBase + 0x10 } // 64-bit BE: address of FWCfgDmaAccess
         // DMA control bits; the selector rides in the upper 16 bits.
         static let ctlRead: UInt32   = 0x02
         static let ctlSelect: UInt32 = 0x08

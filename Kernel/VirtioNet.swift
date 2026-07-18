@@ -1,8 +1,9 @@
 // Virtio network driver (legacy virtio-mmio v1) for QEMU's virtio-net-device.
 //
 // Same discovery model as the input/block drivers (see VirtioInput.swift):
-// up to 32 virtio-mmio slots at 0x0A00_0000 + slot*0x200, legacy register
-// interface only (-global virtio-mmio.force-legacy=on), DeviceID 1 = net.
+// the virtio-mmio slots from the device tree (Machine.virtioMmioBase +
+// slot*0x200, default 0x0A00_0000, up to 32), legacy register interface
+// only (-global virtio-mmio.force-legacy=on), DeviceID 1 = net.
 //
 // I/O model: polled, no IRQs (VIRTQ_AVAIL_F_NO_INTERRUPT on both queues).
 // Queue 0 (receiveq) stays filled with 8 posted buffers of 1600 bytes;
@@ -63,9 +64,9 @@ enum NetDev {
     /// (byte 0 of the address is bits 47...40). Broadcast is all-ones.
     static private(set) var mac: UInt64 = 0
 
-    private static let mmioBase: UInt = 0x0A00_0000
+    private static var mmioBase: UInt { Machine.virtioMmioBase }
     private static let slotStride: UInt = 0x200
-    private static let slotCount = 32
+    private static var slotCount: Int { Machine.virtioMmioSlots }
 
     /// Bytes of legacy virtio_net_hdr prepended to every packet (no mrg rxbuf).
     private static let hdrLen = 10

@@ -27,6 +27,8 @@ SwiftOS kernel 1.0.0-aarch64 (Embedded Swift, bare metal)
 ## Features
 
 **Kernel**
+- **Device-tree machine discovery** (FDT parser): RAM size, CPUs, GIC, UART,
+  fw_cfg, virtio-mmio slots, PSCI method — no hardcoded platform addresses
 - Boot at EL2→EL1, FP/SIMD bring-up on all 4 cores, PL011 UART console
 - **Real SMP**: all 4 cores schedule threads off a global run queue
   (baton-locked context switch, per-core 100 Hz ticks and idles, cross-core
@@ -38,14 +40,16 @@ SwiftOS kernel 1.0.0-aarch64 (Embedded Swift, bare metal)
 - GICv2 + ARM generic timer (100 Hz tick), full exception vector table
 - **Preemptive round-robin kernel threads** (50 ms quantum, context switch in
   the timer IRQ) with real per-thread CPU accounting
-- **EL0 userspace with an SVC syscall ABI** (write/uptime/exit/yield) — the
-  `udemo` command runs an unprivileged position-independent blob that talks
-  to the kernel through `svc`, survives IRQ preemption, and is killed (not
-  the kernel) on any fault
-- **virtio-blk storage** + **SwiftFS**, our own filesystem (superblock, 256
-  inodes, bitmap allocator, write-through) — files survive reboots
-- **Networking**: virtio-net driver + ethernet/ARP/IPv4/ICMP stack — `ping`
-  gets real echo replies, and the kernel answers pings addressed to it
+- **Scheduled EL0 user processes** (`urun`): real user-mode threads with
+  per-process L2/L3 page tables, SVC syscall ABI, preemption and migration
+  across cores (per-core page-table pairs + switch-time TLB flush),
+  containment on faults, kill/reap with full teardown
+- **virtio-blk storage** + **SwiftFS**, our own filesystem — now with a
+  **metadata journal** (sector-level redo log, mount-time replay): verified
+  consistent after SIGKILL mid-write, three cycles
+- **Networking**: virtio-net driver + ethernet/ARP/IPv4/ICMP/**UDP** stack —
+  `ping` gets real echo replies, **`nslookup`/`host` resolve real names via
+  DNS** (QEMU slirp), and the kernel answers pings addressed to it
 - **Power**: PSCI shutdown/reboot (`shutdown` powers the VM off for real)
 - fw_cfg/**ramfb** 1280×800 display, double-buffered, software-composited
 - **virtio-mmio** keyboard + tablet (absolute mouse), plus serial input

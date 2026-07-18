@@ -6,6 +6,11 @@
 @_cdecl("kmain")
 public func kmain(dtb: UInt) -> Never {
     UART.initUART()
+    // Machine discovery from the device tree (Kernel/DTB.swift). x0 is 0 on
+    // QEMU's ELF bare-metal boot path, so discover() probes the RAM base.
+    // Runs before the heap is up: allocation-free, kprint-family logging
+    // only, compiled-in defaults on any failure.
+    _ = Machine.discover(dtb: dtb)
     Clock.initClock()
     KernelHeap.initHeap()
 

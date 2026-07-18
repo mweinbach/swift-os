@@ -357,38 +357,49 @@ final class VFS {
 
     private func persistSubtree(_ node: FSNode, parentInode: Int, path: String) {
         if path == VFS.syslogPath { return }
-        guard let idx = SwiftFS.create(name: node.name, parent: parentInode,
-                                       isDirectory: node.isDirectory,
-                                       executable: VFS.isExecutable(node),
-                                       mtime: VFS.toDiskSecs(node.modified)) else {
+        let mtime = VFS.toDiskSecs(node.modified)
+        let idx: Int?
+        if node.isDirectory {
+            idx = SwiftFS.create(name: node.name, parent: parentInode,
+                                 isDirectory: true, executable: false, mtime: mtime)
+        } else {
+            // Atomic file create: contents and inode commit together.
+            idx = SwiftFS.createFile(name: node.name, parent: parentInode,
+                                     executable: VFS.isExecutable(node), mtime: mtime,
+                                     data: Array(node.contents.utf8))
+        }
+        guard let inodeIndex = idx else {
             klog("[vfs] persist failed for \(path)")
             return
         }
-        node.inode = idx
+        node.inode = inodeIndex
         if node.isDirectory {
             for child in node.children.values {
-                persistSubtree(child, parentInode: idx, path: path + "/" + child.name)
+                persistSubtree(child, parentInode: inodeIndex, path: path + "/" + child.name)
             }
-        } else if !SwiftFS.writeFile(idx, Array(node.contents.utf8), mtime: VFS.toDiskSecs(node.modified)) {
-            klog("[vfs] persist write failed for \(path)")
         }
     }
 
     /// Write-through for a newly created node (file with contents, or dir).
     private func persistNew(node: FSNode, parent: FSNode, path: String) {
         guard Disk.mounted, parent.inode >= 0, path != VFS.syslogPath else { return }
-        guard let idx = SwiftFS.create(name: node.name, parent: parent.inode,
-                                       isDirectory: node.isDirectory,
-                                       executable: VFS.isExecutable(node),
-                                       mtime: VFS.toDiskSecs(node.modified)) else {
+        let mtime = VFS.toDiskSecs(node.modified)
+        let idx: Int?
+        if node.isDirectory {
+            idx = SwiftFS.create(name: node.name, parent: parent.inode,
+                                 isDirectory: true, executable: false, mtime: mtime)
+        } else {
+            // Atomic file create: a power cut leaves the file fully present
+            // or fully absent, never a zero-length phantom.
+            idx = SwiftFS.createFile(name: node.name, parent: parent.inode,
+                                     executable: VFS.isExecutable(node), mtime: mtime,
+                                     data: Array(node.contents.utf8))
+        }
+        guard let inodeIndex = idx else {
             klog("[vfs] persist create failed for \(path)")
             return
         }
-        node.inode = idx
-        if !node.isDirectory,
-           !SwiftFS.writeFile(idx, Array(node.contents.utf8), mtime: VFS.toDiskSecs(node.modified)) {
-            klog("[vfs] persist write failed for \(path)")
-        }
+        node.inode = inodeIndex
     }
 
     /// Write-through for a contents update of an existing file.

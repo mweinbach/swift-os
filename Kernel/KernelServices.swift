@@ -25,7 +25,7 @@ final class KernelServices {
     var wallClockMs: UInt64 { bootWallClockMs &+ Clock.uptimeMs }
 
     // Memory
-    var totalMemoryMB: Double { Double(Config.ramMB) }
+    var totalMemoryMB: Double { Double(Machine.ramSizeMB) }
     var usedMemoryMB: Double {
         16 + Double(KernelHeap.usedBytes) / (1024 * 1024)
     }
