@@ -37,10 +37,10 @@
 enum Panic {
     /// Bounds for validating frame-pointer chain links before dereferencing:
     /// kernel image base (0x4008_0000) .. end of the heap region
-    /// (0x5000_0000). Boot stack (BSS) and all thread stacks (heap pages)
+    /// (0x8080_0000). Boot stack (BSS) and all thread stacks (heap pages)
     /// live inside this window; anything outside is not a sane frame link.
     private static let chainLo: UInt64 = 0x4008_0000
-    private static let chainHi: UInt64 = 0x5000_0000
+    private static let chainHi: UInt64 = 0x8080_0000
 
     /// Frame-pointer chain walk cap.
     private static let maxFrames: UInt64 = 16

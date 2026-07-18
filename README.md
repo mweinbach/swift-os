@@ -2,9 +2,11 @@
 
 A real operating system written **entirely in Swift** — a bare-metal aarch64
 kernel (Embedded Swift, no stdlib runtime) with a Linux-feel GUI desktop
-running on top. Boots on QEMU's `virt` machine. No Linux, and in the
-kernel/userland no Apple frameworks at all: every driver, the scheduler, the
-filesystem, the window manager, the shell, and the renderer are our own Swift.
+running on top. Boots on QEMU's `virt` machine configured to match a
+**Raspberry Pi 5 (8 GB)**: Cortex-A76, 4 cores, 8 GiB RAM. No Linux, and in
+the kernel/userland no Apple frameworks at all: every driver, the scheduler,
+the filesystem, the window manager, the shell, and the renderer are our own
+Swift.
 
 ```
 SwiftOS kernel 1.0.0-aarch64 (Embedded Swift, bare metal)
@@ -25,7 +27,10 @@ SwiftOS kernel 1.0.0-aarch64 (Embedded Swift, bare metal)
 ## Features
 
 **Kernel**
-- Boot at EL2→EL1, FP/SIMD bring-up, PL011 UART console
+- Boot at EL2→EL1, FP/SIMD bring-up on all 4 cores, PL011 UART console
+- **SMP stage 1**: secondary CPUs online via PSCI CPU_ON (parked; the
+  scheduler/heap are still main-CPU only — see AGENTS.md)
+- MMU + caches identity-mapping the full **8 GiB**, 1 GiB kernel heap
 - MMU + caches (identity map), page-bitmap physical allocator + boundary-tag
   heap backing the Swift runtime's `posix_memalign`/`free`
 - GICv2 + ARM generic timer (100 Hz tick), full exception vector table
@@ -115,7 +120,9 @@ alignment faults, unicode shims, QEMU quirks).
 
 ## Current limitations
 
-- Targets QEMU `virt`; real Apple Silicon bring-up is future work
+- Targets QEMU `virt` (Pi 5 profile: A76, 4 cores, 8 GiB); real-hardware
+  bring-up is future work
+- SMP is stage 1: secondaries are parked; per-core scheduling is not here yet
 - Apps share the compositor thread (kernel threads are preemptive; EL0 is a
   single synchronous demo run, not yet scheduled user processes)
 - Networking is IPv4+ICMP so far — no TCP/UDP yet

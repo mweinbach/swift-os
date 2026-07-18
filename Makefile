@@ -14,7 +14,7 @@ USERLAND_SRC := $(wildcard Userland/*.swift)
 ASM_SRC      := $(wildcard Kernel/*.S)
 ASM_OBJ      := $(patsubst Kernel/%.S,build/%.o,$(ASM_SRC))
 
-QEMUFLAGS := -M virt -cpu cortex-a72 -m 512M \
+QEMUFLAGS := -M virt -cpu cortex-a76 -m 8192 -smp 4 \
              -device ramfb \
              -device virtio-keyboard-device \
              -device virtio-tablet-device \

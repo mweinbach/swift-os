@@ -1,6 +1,6 @@
 // Kernel heap: 4 KiB physical page allocator + kernel malloc heap.
 //
-// Managed region [heapStart, heapEnd) = 248 MiB, laid out as:
+// Managed region [heapStart, heapEnd) = 1 GiB, laid out as:
 //   [heapStart, heapStart + 8 KiB)   page bitmap, 1 bit per 4 KiB page
 //                                    (63,488 pages = 992 words; 2 pages reserved)
 //   [arenaStart, arenaEnd)           64 MiB kernel malloc arena (boundary-tag
@@ -39,7 +39,7 @@
 enum KernelHeap {
     // Public region bounds (unchanged from the bump-allocator v1).
     static let heapStart: UInt = 0x4080_0000
-    static let heapEnd:   UInt = 0x5000_0000
+    static let heapEnd:   UInt = 0x8080_0000
 
     // MARK: - Geometry
 

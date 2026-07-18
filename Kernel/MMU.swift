@@ -9,6 +9,7 @@
 //     L0[0]  -> L1 table
 //   L1 (1 page, zeroed):
 //     L1[0]  = 1 GiB block [0x0000_0000, 0x4000_0000)
+//     L1[1..8] -> L2 tables (8 GiB of RAM, one per gigabyte)
 //              device-nGnRnE (MAIR attr0), PXN — UART, GIC, virtio-mmio
 //     L1[1]  -> L2 table (the RAM gigabyte, split into 2 MiB slots so a
 //              slot hosting EL0 pages can later be refined to 4 KiB
@@ -79,13 +80,14 @@ enum MMU {
     private static let paMask:    UInt64 = 0x0000_FFFF_FFFF_F000
 
     private static let ramBase: UInt = 0x4000_0000
-    private static let ramEnd:  UInt = 0x8000_0000   // end of the mapped gigabyte
+    private static let ramEnd:  UInt = 0x2_4000_0000 // end of the mapped RAM (8 GiB)
 
-    /// L2 table covering the RAM gigabyte [0x4000_0000, 0x8000_0000), built
-    /// by initMMU. 0 when the MMU was never initialized (MMU off): allowEL0
-    /// is then a no-op — with translation disabled there are no permission
-    /// checks for EL0 to trip over anyway.
-    private static var l2RAM: UInt = 0
+    /// L2 tables covering the 8 RAM gigabytes [0x4000_0000, 0x2_4000_0000)
+    /// (one 512-slot table per gigabyte), built by initMMU. Entry 0 is 0 when
+    /// the MMU was never initialized (MMU off): allowEL0 is then a no-op —
+    /// with translation disabled there are no permission checks for EL0 to
+    /// trip over anyway.
+    private static var l2Tables = [UInt](repeating: 0, count: 8)
 
     /// Build the identity map and enable the MMU + I/D caches.
     /// On any sanity failure: log, leave the MMU off, return false.
@@ -102,34 +104,39 @@ enum MMU {
         }
 
         guard let l0 = KernelHeap.allocPages(1), let l1 = KernelHeap.allocPages(1),
-              let l2 = KernelHeap.allocPages(1),
-              l0 & 0xFFF == 0, l1 & 0xFFF == 0, l2 & 0xFFF == 0 else {
+              l0 & 0xFFF == 0, l1 & 0xFFF == 0 else {
             klog("[mmu] page table allocation failed, MMU stays off")
             return false
         }
         zeroPage(l0)
         zeroPage(l1)
-        zeroPage(l2)
 
         // L0[0] -> L1.
         putDesc(l0, 0, UInt64(l1) | descTable)
         // L1[0]: [0x0000_0000, 0x4000_0000) device-nGnRnE (MAIR attr0),
         // execute-never at both ELs.
         putDesc(l1, 0, 0x0000_0000 | pxn | uxn | af | descBlock)
-        // L2: 512 x 2 MiB blocks spanning [0x4000_0000, 0x8000_0000), normal
-        // WB (MAIR attr1), inner shareable, EL1-only RW — the same mapping
-        // the old 1 GiB L1 block produced, just split so allowEL0 can later
-        // relax single slots. All 512 MiB of RAM [0x4000_0000, 0x6000_0000)
-        // included.
-        var slot = 0
-        while slot < 512 {
-            let pa = UInt64(0x4000_0000) &+ (UInt64(slot) << 21)
-            putDesc(l2, slot, pa | af | shInner | attrIndx1 | descBlock)
-            slot &+= 1
+        // L1[1...8]: 8 GiB of RAM [0x4000_0000, 0x2_4000_0000), one L2 table
+        // per gigabyte, 512 x 2 MiB blocks each, normal WB (MAIR attr1),
+        // inner shareable, EL1-only RW — extended for the Pi 5's 8 GiB and
+        // kept slot-splittable so allowEL0 can relax single 2 MiB slots.
+        var gb = 0
+        while gb < 8 {
+            guard let l2 = KernelHeap.allocPages(1), l2 & 0xFFF == 0 else {
+                klog("[mmu] page table allocation failed, MMU stays off")
+                return false
+            }
+            zeroPage(l2)
+            var slot = 0
+            while slot < 512 {
+                let pa = (UInt64(gb &+ 1) << 30) &+ (UInt64(slot) << 21)
+                putDesc(l2, slot, pa | af | shInner | attrIndx1 | descBlock)
+                slot &+= 1
+            }
+            putDesc(l1, gb + 1, UInt64(l2) | descTable)
+            l2Tables[gb] = l2
+            gb &+= 1
         }
-        // L1[1] -> L2 table.
-        putDesc(l1, 1, UInt64(l2) | descTable)
-        l2RAM = l2
 
         // Program the translation regime before enabling it.
         mmuWriteMAIR(mairValue)
@@ -183,10 +190,10 @@ enum MMU {
     /// spanning several 2 MiB slots is supported — each slot gets its own
     /// L3 table, each page run is capped to its slot.
     ///
-    /// No-op when the MMU was never initialized (l2RAM == 0): with
+    /// No-op when the MMU was never initialized (l2Tables[0] == 0): with
     /// translation off, EL0 accesses are unchecked anyway.
     static func allowEL0(base: UInt, byteCount: UInt) {
-        guard l2RAM != 0 else { return }
+        guard l2Tables[0] != 0 else { return }
         guard byteCount > 0 else {
             klog("[mmu] allowEL0: zero length refused")
             return
@@ -237,7 +244,9 @@ enum MMU {
     /// then left as its original block). Idempotent: an already-split slot
     /// returns its existing table.
     private static func ensureL3Table(slot: Int) -> UInt? {
-        let entry = UnsafeMutablePointer<UInt64>(bitPattern: l2RAM + UInt(slot) * 8)!
+        guard slot >= 0, slot < 4096 else { return nil }
+        let l2 = l2Tables[slot >> 9]
+        let entry = UnsafeMutablePointer<UInt64>(bitPattern: l2 + UInt(slot & 511) * 8)!
         let cur = entry.pointee
         if cur & 0b11 == descTable {
             return UInt(cur & paMask)            // already split
@@ -321,7 +330,7 @@ enum MMU {
             return false
         }
         // The L2 entry must now be a table descriptor pointing at the L3 page.
-        let l2e = loadDesc(l2RAM, slot)
+        let l2e = loadDesc(l2Tables[slot >> 9], slot & 511)
         if l2e & 0b11 != descTable || l2e & paMask != UInt64(l3) {
             klog("[mmu] self-test: L2 entry is not the installed L3 table")
             ok = false
@@ -354,7 +363,7 @@ enum MMU {
         }
 
         // Revert to the pristine block mapping; free everything touched.
-        putDesc(l2RAM, slot, blockDesc)
+        putDesc(l2Tables[slot >> 9], slot & 511, blockDesc)
         syncTables()
         KernelHeap.freePages(l3, count: 1)
         KernelHeap.freePages(scratch, count: 1)

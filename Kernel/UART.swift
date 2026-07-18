@@ -84,10 +84,15 @@ func kprintDec(_ v: Int64) {
 }
 
 /// Log line: serial + boot log buffer (used by the boot splash and /var/log/syslog).
+/// Serialized through the SMP klog spinlock so lines from different cores
+/// never interleave.
 func klog(_ s: String) {
+    let lock = armKlogLockAddr()
+    armSpinLock(lock)
     UART.write(s)
     UART.write("\n")
     BootLog.add(s)
+    armSpinUnlock(lock)
 }
 
 func kpanic(_ message: String) -> Never {

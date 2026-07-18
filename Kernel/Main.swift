@@ -35,6 +35,7 @@ public func kmain(dtb: UInt) -> Never {
 
     Interrupts.initInterrupts()
     Scheduler.initScheduler()
+    SMP.startSecondaries()
     let haveDisplay = Display.initDisplay()
     if !haveDisplay {
         klog("[boot] no ramfb device — continuing headless (serial only)")

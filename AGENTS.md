@@ -6,6 +6,16 @@ shell, file manager, text editor, system monitor — running on top. Boots on
 QEMU's `virt` machine. No Linux, and in the kernel/userland no Apple
 frameworks at all (no Foundation/CoreGraphics/AppKit/Metal).
 
+Machine profile: **Raspberry Pi 5 match** — QEMU has no raspi5 machine model
+(and raspi3b/raspi4b use an incompatible BCM peripheral map), so we run
+`-M virt -cpu cortex-a76 -smp 4 -m 8192`: same Cortex-A76 cores, core count,
+and 8 GiB RAM. The MMU identity-maps 8 GiB (L1[1..8] -> per-GiB L2 tables);
+the kernel heap is 1 GiB at 0x40800000-0x80800000. SMP stage 1: secondaries
+come online via PSCI CPU_ON (per-core FP/SIMD enable), print one
+spinlock-guarded line, and park in wfi — scheduler/heap/drivers are still
+main-CPU only (IRQ-mask guards do NOT protect across cores; per-core run
+queues + real locks are the next round).
+
 ## Layout
 
 - `Kernel/` — the kernel: `Boot.S` (entry, EL2→EL1 drop, BSS, FP/SIMD enable,

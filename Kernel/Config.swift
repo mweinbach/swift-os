@@ -12,6 +12,13 @@ enum Config {
     static let screenWidth = 1280
     static let screenHeight = 800
 
+    /// Machine profile (QEMU Pi 5 match: cortex-a76, 4 cores, 8 GiB).
+    static let ramMB = 8192
+    static let cpuCount = 4
+    /// PSCI CPU_ON bring-up of secondary cores (parked secondaries for now;
+    /// the scheduler and heap remain main-CPU only).
+    static let smpEnabled = true
+
     /// Preemptive round-robin kernel threads (Kernel/Scheduler.swift).
     /// When false, Scheduler.initScheduler() is a no-op and the timer tick
     /// never context-switches: the compositor loop runs alone, exactly as
