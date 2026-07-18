@@ -11,8 +11,17 @@ frameworks at all (no Foundation/CoreGraphics/AppKit/Metal).
 - `Kernel/` — the kernel: `Boot.S` (entry, EL2→EL1 drop, BSS, FP/SIMD enable,
   asm helpers), `Main.swift` (kmain + compositor loop), `UART.swift` (PL011 +
   klog/kprint + BootLog), `MMIO.swift` (volatile accessors), `Interrupts.swift`
-  + `Vectors.S` (GICv2 + 100 Hz timer), `Heap.swift` (page bitmap + boundary-tag
-  malloc backing `posix_memalign`/`free`), `MMU.swift` + `MMU.S` (identity map,
+  + `Vectors.S` (GICv2 + 100 Hz timer; the fatal sync/FIQ/SError vector stubs
+  snapshot all GPRs and call `swift_fatal_exception`), `Panic.swift` (crash
+  dump: full register/ESR/FAR dump + frame-pointer backtrace on serial, then
+  the same text rendered onto the front framebuffer — zero allocation,
+  StaticString-only, recursive-fault guard; serial-only when `Display.width`
+  is 0), `Heap.swift` (page bitmap + boundary-tag
+  malloc backing `posix_memalign`/`free`; header/footer words carry a 32-bit
+  magic — 0xA110CA7E allocated / 0xFEE1DEAD freed — bad frees are logged on
+  the UART and ignored, never panicking or corrupting; `validate()` is an
+  allocation-free deep audit callable from kworker; heap diagnostics use
+  literal-only UART writes because klog allocates via BootLog), `MMU.swift` + `MMU.S` (identity map,
   caches), `RamFB.swift` (`Display`: fw_cfg/ramfb 1280x800 + back buffer +
   present), `VirtioInput.swift` (`Input`: virtio-mmio legacy keyboard/tablet +
   UART serial keys → `OSEvent`), `VirtioBlk.swift` (`BlockDev`: virtio-mmio
@@ -43,8 +52,14 @@ frameworks at all (no Foundation/CoreGraphics/AppKit/Metal).
 - `tools/genfont.swift` — macOS/CoreText generator that produces FontData.swift.
 - `tools/mkblob.py` — assembles `User/demo.S` (pure position-independent EL0
   demo, `svc #0` ABI) and links it flat at address 0 into `Userland/UserBlob.swift`.
-- `tools/smoketest.py` — regression harness: builds, boots headless, asserts
-  boot log, injects a shell battery, optional `--cocoa` screenshot pixel checks.
+- `tools/smoketest.py` — regression harness: builds, boots headless (with
+  virtio-net attached), asserts the ordered boot log (heap → gic → sched →
+  fb → input → net → login), injects the standard + stress shell batteries
+  (storage-mode check, ping/udemo/tree/du/find, TOP-mode entry/exit), and
+  scans the whole run for panic/heap-fault markers. Flags: `--cocoa`
+  (screenshot pixel checks), `--with-disk` (mounts a snapshot of
+  build/disk.img, requires persistent storage online), `--soak N`
+  (seeded-random command/key injection for N seconds), `--keep-qemu`.
 - `Host-macOS/` — the earlier macOS SwiftPM harness (Metal/AppKit app showing
   the same desktop). Secondary; the kernel is the product. (Renderer note:
   CTFontDrawGlyphs already draws upright with bitmap row 0 = visual top —
@@ -61,7 +76,7 @@ make disk       # create the 32MB build/disk.img (run/serial depend on it)
 make font       # regenerate Userland/FontData.swift (needs macOS CoreText)
 python3 tools/mkblob.py   # regenerate Userland/UserBlob.swift from User/demo.S
 make app        # build the Host-macOS harness
-python3 tools/smoketest.py [--cocoa]   # regression gate: boot + battery + pixels
+python3 tools/smoketest.py [--cocoa] [--with-disk] [--soak N]   # regression gate: boot + batteries + pixels
 ```
 
 Round-2 features: preemptive kernel threads (main/idle/kworker with real
@@ -141,12 +156,20 @@ splash eats keystrokes for ~12 s wall after "login session started".
   (Vectors.S) once context switches exist — otherwise a second IRQ on another
   thread erets to the wrong PC. This was a real bug; don't regress it.
 - The RAM gigabyte is mapped as an L2 table (512 x 2 MiB blocks), not a single
-  L1 block: `MMU.allowEL0` marks the slot holding the EL0 demo pages
-  EL0+EL1 RW + PXN. Don't fold it back into an L1 block — EL0 userspace
-  (Kernel/Userspace.swift) depends on per-slot AP bits. The lower-EL vector
+  L1 block: `MMU.allowEL0(base:byteCount:)` replaces the covering slot's L2
+  block with an on-demand L3 table (512 x 4 KiB pages inheriting the slot's
+  RAM attrs, EL1-only by default) and marks exactly the requested pages
+  EL0+EL1 RW (+PXN; UXN stays clear so the user blob can execute) —
+  neighbouring heap pages in the slot stay EL1-only, so an EL0 access
+  outside its window faults and is contained by UserProcess. Don't fold it
+  back into an L1 block — EL0 userspace (Kernel/Userspace.swift) depends on
+  the L2/L3 split. The lower-EL vector
   rows in Vectors.S are live: sync_lower_entry's 176-byte frame contract with
-  swift_sync_lower (x0-x18, x30, SPSR, ELR) mirrors irq_entry — keep them in
-  sync.
+  swift_sync_lower (x0-x18, x30, SPSR, ELR) is unchanged — but irq_entry's
+  frame is now a LARGER 304-byte one (x0-x18, x30, SPSR, ELR at the same
+  offsets 0-175, plus q0-q7 at 176-303, because NEON caller-saved regs were
+  a preemption corruption hole). Keep the offsets 0-175 of the two frames
+  identical.
 - The compositor skips present when nothing changed (SoftwareSurface.drawCalls
   + events + cursor position, 500ms staleness cap) — idle uses ~70x less CPU;
   interactive latency is one tick. Under QEMU TCG it still measures high CPU

@@ -13,10 +13,10 @@
 // switch away and later eret right back into the blob.
 //
 // Memory: two contiguous pages from allocPages — page 0 holds the blob
-// (entry at offset 0), page 1 is the user stack. MMU.allowEL0 marks the
-// covering 2 MiB L2 slot(s) EL0+EL1 RW (stage-1 granularity: the whole
-// slot, neighbours included — see MMU.swift). Pages are allocated once and
-// kept; every run re-zeroes and re-copies, so runs are independent.
+// (entry at offset 0), page 1 is the user stack. MMU.allowEL0 marks exactly
+// the covering 4 KiB pages EL0+EL1 RW (+PXN); neighbouring pages stay
+// EL1-only. Pages are allocated once and kept; every run re-zeroes and
+// re-copies, so runs are independent.
 //
 // ================================= SYSCALL ABI =============================
 // svc #0, syscall number in x8, args in x0-x5, result in x0. Unknown

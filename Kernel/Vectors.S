@@ -5,6 +5,19 @@
 // SVC syscalls and user faults land in sync_lower_entry, timer IRQs that
 // preempt EL0 reuse irq_entry (its frame covers SPSR/ELR, so eret returns
 // to EL0 exactly as it returns to an interrupted EL1 thread).
+//
+// Fatal paths (Kernel/Panic.swift): every fatal exception — synchronous at
+// EL1, FIQ, SError, or an architecturally unexpected vector — snapshots ALL
+// GPRs plus the exception-time SP into a 256-byte stack frame and calls
+//   swift_fatal_exception(kind=x0, esr=x1, elr=x2, far=x3, spsr=x4, frame=x5)
+// with frame = [x0...x30] at [sp+0..240] and the exception-time SP at
+// [sp+248]. kind: 0 = sync at EL1, 1 = FIQ, 2 = SError, 3 = unexpected
+// vector. The ONLY sync exceptions not taking this path come from EL0 and
+// are handled by sync_lower_entry -> swift_sync_lower: SVC64 syscalls are
+// serviced, and non-SVC user faults kill just the run (the documented user
+// crash guard in Kernel/Userspace.swift — deliberate; do NOT "harden" that
+// into a kernel panic. A lower-EL sync with no active run still panics via
+// kpanic, which is the can't-happen path).
 
 .section .text.vectors
 
@@ -55,18 +68,49 @@ exception_vectors:
 
 // ------------------------------------------------------------ handlers -----
 
-// Synchronous exception from EL1h: hand ESR/ELR to Swift, print + panic.
+// Register snapshot for the fatal paths: 256-byte frame on the current
+// stack, [sp+0..240] = x0...x30, [sp+248] = the exception-time SP.
+// Clobbers x9 (already saved). Passed to swift_fatal_exception as x5 = sp.
+.macro PANIC_FRAME
+    sub     sp, sp, #256
+    stp     x0,  x1,  [sp, #0]
+    stp     x2,  x3,  [sp, #16]
+    stp     x4,  x5,  [sp, #32]
+    stp     x6,  x7,  [sp, #48]
+    stp     x8,  x9,  [sp, #64]
+    stp     x10, x11, [sp, #80]
+    stp     x12, x13, [sp, #96]
+    stp     x14, x15, [sp, #112]
+    stp     x16, x17, [sp, #128]
+    stp     x18, x19, [sp, #144]
+    stp     x20, x21, [sp, #160]
+    stp     x22, x23, [sp, #176]
+    stp     x24, x25, [sp, #192]
+    stp     x26, x27, [sp, #208]
+    stp     x28, x29, [sp, #224]
+    str     x30, [sp, #240]
+    add     x9, sp, #256
+    str     x9, [sp, #248]                  // SP at exception time
+.endm
+
+// Synchronous exception from EL1h: full register snapshot + ESR/ELR/FAR/SPSR
+// to Kernel/Panic.swift (via swift_fatal_exception). Never returns.
 sync_exception_entry:
-    mrs     x0, ESR_EL1
-    mrs     x1, ELR_EL1
-    bl      swift_sync_exception            // Never returns
+    PANIC_FRAME
+    mov     x0, #0                          // kind 0 = sync at EL1
+    mrs     x1, ESR_EL1
+    mrs     x2, ELR_EL1
+    mrs     x3, FAR_EL1
+    mrs     x4, SPSR_EL1
+    mov     x5, sp
+    bl      swift_fatal_exception           // Never returns
 1:  wfi
     b       1b
 
 // Synchronous exception from EL0 (AArch64): SVC syscalls and user faults.
-// Saves the same 176-byte frame as irq_entry (x0-x18, x30, SPSR_EL1,
-// ELR_EL1 — layout documented at the swift_sync_lower call site in
-// Kernel/Userspace.swift), then:
+// Saves a 176-byte frame (x0-x18, x30, SPSR_EL1, ELR_EL1 — layout documented
+// at the swift_sync_lower call site in Kernel/Userspace.swift; irq_entry's
+// frame below is a different, larger one — the two are NOT shared), then:
 //   x0 = ESR_EL1, x1 = frame pointer, bl swift_sync_lower
 // Return 0: resume EL0 — write the frame back (the handler may have updated
 // the saved x0 return value; ELR already points past the svc on entry, so
@@ -128,13 +172,22 @@ sync_lower_entry:
     b       el0_exited                    // in Kernel/Userspace.S
 
 // IRQ from EL1h. The interrupted context owns every register, so save all
-// caller-saved GPRs (x0-x18) and x30 around the Swift call, then eret.
+// caller-saved GPRs (x0-x18), x30, AND the AAPCS caller-saved NEON
+// registers q0-q7 around the Swift call, then eret. (q8-q15 are
+// callee-saved per AAPCS; they ride the scheduler's switch frame in
+// Scheduler.S.) Without q0-q7 here, any vector code the IRQ handler emits
+// (the compiler can and does, e.g. 16-byte copies) would silently corrupt
+// the interrupted context. Frame: 304 bytes —
+//   [sp+0..143]   x0-x17 (stp pairs)
+//   [sp+144/152]  x18 / x30
+//   [sp+160]      SPSR_EL1 / ELR_EL1
+//   [sp+176..303] q0-q7 (128-bit stp pairs)
 // SPSR_EL1/ELR_EL1 are saved in the frame too: with the preemptive
 // scheduler, the handler may context-switch, and the next IRQ (on another
 // thread) would otherwise overwrite them — the eventual eret must restore
 // THIS thread's exception context, not the latest one.
 irq_entry:
-    sub     sp, sp, #176
+    sub     sp, sp, #304
     stp     x0,  x1,  [sp, #0]
     stp     x2,  x3,  [sp, #16]
     stp     x4,  x5,  [sp, #32]
@@ -149,6 +202,10 @@ irq_entry:
     mrs     x9, SPSR_EL1
     mrs     x10, ELR_EL1
     stp     x9, x10, [sp, #160]
+    stp     q0,  q1,  [sp, #176]
+    stp     q2,  q3,  [sp, #208]
+    stp     q4,  q5,  [sp, #240]
+    stp     q6,  q7,  [sp, #272]
 
     movz    x9, #0x0801, lsl #16            // GICC base 0x08010000
     ldr     w0, [x9, #0x0C]                 // GICC_IAR: acknowledge
@@ -157,6 +214,10 @@ irq_entry:
     b.eq    1f                              // spurious: no EOIR, just return
     bl      swift_irq_dispatch              // x0 = IAR: tick, reprogram, EOIR
 1:
+    ldp     q0,  q1,  [sp, #176]
+    ldp     q2,  q3,  [sp, #208]
+    ldp     q4,  q5,  [sp, #240]
+    ldp     q6,  q7,  [sp, #272]
     ldp     x9, x10, [sp, #160]
     msr     SPSR_EL1, x9
     msr     ELR_EL1, x10
@@ -171,23 +232,47 @@ irq_entry:
     ldp     x16, x17, [sp, #128]
     ldr     x18, [sp, #144]
     ldr     x30, [sp, #152]
-    add     sp, sp, #176
+    add     sp, sp, #304
     eret
 
+// FIQ: none are configured (the GIC is run in IRQ-only mode), so taking one
+// is fatal. FIQ entry sets no ESR/FAR — pass zeroes; ELR/SPSR are real.
 fiq_entry:
-    bl      swift_fiq_exception             // Never returns
+    PANIC_FRAME
+    mov     x0, #1                          // kind 1 = FIQ
+    mov     x1, xzr                         // ESR is not meaningful on FIQ
+    mrs     x2, ELR_EL1
+    mov     x3, xzr                         // FAR is not meaningful on FIQ
+    mrs     x4, SPSR_EL1
+    mov     x5, sp
+    bl      swift_fatal_exception           // Never returns
 1:  wfi
     b       1b
 
+// SError (asynchronous external abort): ESR carries the (often imprecise)
+// syndrome; ELR is approximate. Always fatal.
 serror_entry:
-    mrs     x0, ESR_EL1
-    mrs     x1, ELR_EL1
-    bl      swift_serror_exception          // Never returns
+    PANIC_FRAME
+    mov     x0, #2                          // kind 2 = SError
+    mrs     x1, ESR_EL1
+    mrs     x2, ELR_EL1
+    mrs     x3, FAR_EL1
+    mrs     x4, SPSR_EL1
+    mov     x5, sp
+    bl      swift_fatal_exception           // Never returns
 1:  wfi
     b       1b
 
+// A vector row the kernel should never take (SP0 rows, AArch32 rows).
 vector_unexpected:
-    bl      swift_unexpected_vector         // Never returns
+    PANIC_FRAME
+    mov     x0, #3                          // kind 3 = unexpected vector
+    mrs     x1, ESR_EL1
+    mrs     x2, ELR_EL1
+    mrs     x3, FAR_EL1
+    mrs     x4, SPSR_EL1
+    mov     x5, sp
+    bl      swift_fatal_exception           // Never returns
 1:  wfi
     b       1b
 
@@ -211,4 +296,12 @@ arm_write_cntp_tval:
 .globl arm_write_cntp_ctl
 arm_write_cntp_ctl:
     msr     CNTP_CTL_EL0, x0
+    ret
+
+// Mask the whole DAIF set (debug, SError, IRQ, FIQ) — panic/halt paths,
+// where the timer tick and any nested exception must stop entirely.
+// (arm_irq_disable in Boot.S only masks IRQ.)
+.globl arm_mask_all
+arm_mask_all:
+    msr     daifset, #0xF
     ret

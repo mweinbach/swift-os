@@ -14,6 +14,8 @@ public func kmain(dtb: UInt) -> Never {
     klog("[boot] timer frequency \(Clock.frequency) Hz")
     klog("[boot] heap \(KernelHeap.totalBytes / (1024 * 1024)) MB")
 
+    _ = FontData.bitmap.count // warm the lazy font for the panic renderer
+
     if KernelHeap.selfTest() {
         klog("[boot] heap self-test ok")
     } else {

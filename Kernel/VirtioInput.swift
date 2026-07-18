@@ -91,6 +91,10 @@ private struct VirtioInputDevice {
 }
 
 enum Input {
+    /// Device faults contained at runtime (ring desyncs that forced a full
+    /// device reset). Diagnostics only; never reset to 0.
+    static private(set) var errorCount: Int = 0
+
     /// Current pointer position in framebuffer pixels.
     static private(set) var mouseX: Int = Config.screenWidth / 2
     static private(set) var mouseY: Int = Config.screenHeight / 2
@@ -174,16 +178,15 @@ enum Input {
         return false
     }
 
-    /// Legacy virtio bring-up: status handshake, then vring + buffer posting.
+    /// Legacy virtio bring-up: bounded reset, status handshake, then vring +
+    /// buffer posting. Any validation failure returns nil — that device is
+    /// skipped instead of trusting a misbehaving one.
     private static func setupDevice(base: UInt, kind: VirtioInputDevice.Kind) -> VirtioInputDevice? {
-        mmioWrite32(base + VReg.status, 0)                            // reset
-        mmioWrite32(base + VReg.status, stAcknowledge)
-        mmioWrite32(base + VReg.status, stAcknowledge | stDriver)
-        _ = mmioRead32(base + VReg.hostFeatures)                      // we require nothing
-        mmioWrite32(base + VReg.guestFeatures, 0)
-        // FEATURES_OK is optional on the legacy interface; continue either way.
-        mmioWrite32(base + VReg.status, stAcknowledge | stDriver | stFeaturesOK)
-        _ = mmioRead32(base + VReg.status)
+        guard resetDevice(base) else {
+            klog("[input] device did not complete reset")
+            return nil
+        }
+        handshake(base)
 
         mmioWrite32(base + VReg.guestPageSize, 4096)
         mmioWrite32(base + VReg.queueSel, 0)                          // queue 0 = eventq
@@ -195,11 +198,47 @@ enum Input {
 
         // Vring: descriptor table (qsize*16 B) + avail ring in page 0,
         // used ring at +4096 (QueueAlign). Buffers live on their own page.
+        // Pages are allocated once here and reused by later recovery resets.
         guard let vq = KernelHeap.allocPages(2) else { return nil }
         guard let bufs = KernelHeap.allocPages(1) else { return nil }
+        let rings = bringUpQueue(base: base, vq: vq, bufs: bufs, qsize: qsize)
+        goLive(base)
+
+        return VirtioInputDevice(base: base, kind: kind, qsize: qsize,
+                                 availBase: rings.avail, usedBase: rings.used,
+                                 bufBase: bufs, availIdx: qsize, lastUsed: 0)
+    }
+
+    /// Full device reset: Status=0, then a BOUNDED poll for reset-complete —
+    /// a device that never clears Status must not hang boot or recovery.
+    private static func resetDevice(_ base: UInt) -> Bool {
+        mmioWrite32(base + VReg.status, 0)
+        var spins = 0
+        while mmioRead32(base + VReg.status) != 0 {
+            spins += 1
+            if spins >= 1_000_000 { return false }
+        }
+        return true
+    }
+
+    /// Status handshake up to FEATURES_OK (we negotiate no features).
+    private static func handshake(_ base: UInt) {
+        mmioWrite32(base + VReg.status, stAcknowledge)
+        mmioWrite32(base + VReg.status, stAcknowledge | stDriver)
+        _ = mmioRead32(base + VReg.hostFeatures)                      // we require nothing
+        mmioWrite32(base + VReg.guestFeatures, 0)
+        // FEATURES_OK is optional on the legacy interface; continue either way.
+        mmioWrite32(base + VReg.status, stAcknowledge | stDriver | stFeaturesOK)
+        _ = mmioRead32(base + VReg.status)
+    }
+
+    /// Zero and program the eventq vring at `vq`, post all `qsize` buffers at
+    /// `bufs`, and return the avail/used ring addresses. Shared by
+    /// setupDevice() and runtime fault recovery.
+    private static func bringUpQueue(base: UInt, vq: UInt, bufs: UInt,
+                                     qsize: UInt16) -> (avail: UInt, used: UInt) {
         zeroRegion(vq, 2 * 4096)
         zeroRegion(bufs, 4096)
-
         let availBase = vq + UInt(qsize) * 16
         let usedBase = vq + 4096
         mmioWrite32(base + VReg.queuePFN, UInt32(vq / 4096))
@@ -218,15 +257,43 @@ enum Input {
         armDsbSy()
         vstore16(availBase + 2, qsize)      // avail.idx: all buffers posted
         armDsbSy()
+        return (availBase, usedBase)
+    }
 
-        // Acknowledge any stale interrupt, go live, then kick the device.
+    /// Ack stale interrupts, set DRIVER_OK, and kick the eventq.
+    private static func goLive(_ base: UInt) {
         mmioWrite32(base + VReg.interruptACK, mmioRead32(base + VReg.interruptStatus))
         mmioWrite32(base + VReg.status, stAcknowledge | stDriver | stFeaturesOK | stDriverOK)
         mmioWrite32(base + VReg.queueNotify, 0)
+    }
 
-        return VirtioInputDevice(base: base, kind: kind, qsize: qsize,
-                                 availBase: availBase, usedBase: usedBase,
-                                 bufBase: bufs, availIdx: qsize, lastUsed: 0)
+    /// Contain a ring desync: full device reset + queue re-init on the
+    /// existing pages (all buffers reposted), counted in errorCount, then
+    /// carry on — the next poll sees a clean, empty ring. Never spins; if
+    /// the device refuses to reset it is left quiesced (zero ring = no
+    /// events) and the rest of the system is unaffected.
+    private static func recoverDevice(_ d: inout VirtioInputDevice) {
+        errorCount += 1
+        klog("[input] ring desync — resetting device")
+        let base = d.base
+        let vq = d.availBase - UInt(d.qsize) * 16
+        guard resetDevice(base) else {
+            klog("[input] device reset FAILED — device left quiesced")
+            zeroRegion(vq, 2 * 4096)
+            d.availIdx = 0
+            d.lastUsed = 0
+            return
+        }
+        handshake(base)
+        mmioWrite32(base + VReg.guestPageSize, 4096)
+        mmioWrite32(base + VReg.queueSel, 0)
+        mmioWrite32(base + VReg.queueNum, UInt32(d.qsize))
+        mmioWrite32(base + VReg.queueAlign, 4096)
+        _ = bringUpQueue(base: base, vq: vq, bufs: d.bufBase, qsize: d.qsize)
+        goLive(base)
+        // Same pages, so availBase/usedBase/bufBase are unchanged.
+        d.availIdx = d.qsize
+        d.lastUsed = 0
     }
 
     private static func zeroRegion(_ base: UInt, _ bytes: Int) {
@@ -264,15 +331,30 @@ enum Input {
 
     private static func drain(_ d: inout VirtioInputDevice, into out: inout [OSEvent]) {
         let usedIdx = vload16(d.usedBase + 2)
+        // Ring validation: the device may only have filled buffers we posted,
+        // so the used idx must have advanced monotonically by at most qsize.
+        // Anything else is a desync — reset the device and retry next poll
+        // instead of trusting ring contents.
+        let delta = usedIdx &- d.lastUsed
+        guard delta <= d.qsize else {
+            recoverDevice(&d)
+            return
+        }
         while d.lastUsed != usedIdx && out.count < maxEventsPerPoll {
             let slot = d.lastUsed % d.qsize
-            let id = UInt16(mmioRead32(d.usedBase + 4 + UInt(slot) * 8) & 0xFFFF)
-            if id < d.qsize {
-                let b = d.bufBase + UInt(id) * bufLen
-                handleEvent(d.kind, type: vload16(b), code: vload16(b + 2),
-                            value: mmioRead32(b + 4), into: &out)
-                repost(&d, id: id)
+            let elem = d.usedBase + 4 + UInt(slot) * 8
+            let id = UInt16(mmioRead32(elem) & 0xFFFF)
+            let written = mmioRead32(elem + 4)
+            // The descriptor id must be one we posted and the byte count
+            // must fit the buffer behind it.
+            guard id < d.qsize, written <= UInt32(bufLen) else {
+                recoverDevice(&d)
+                return
             }
+            let b = d.bufBase + UInt(id) * bufLen
+            handleEvent(d.kind, type: vload16(b), code: vload16(b + 2),
+                        value: mmioRead32(b + 4), into: &out)
+            repost(&d, id: id)
             d.lastUsed &+= 1
         }
     }

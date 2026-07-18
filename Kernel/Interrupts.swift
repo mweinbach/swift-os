@@ -122,34 +122,16 @@ func swiftIrqDispatch(_ iar: UInt32) {
     Interrupts.handleIrq(iar)
 }
 
-/// Synchronous exception at EL1h: dump ESR/ELR, then die.
-@_cdecl("swift_sync_exception")
-func swiftSyncException(_ esr: UInt64, _ elr: UInt64) -> Never {
-    kprint("\nSYNC EXCEPTION  ESR=")
-    kprintHex(esr)
-    kprint("  ELR=")
-    kprintHex(elr)
-    kprint("\n")
-    kpanic("unhandled synchronous exception")
-}
-
-@_cdecl("swift_fiq_exception")
-func swiftFiqException() -> Never {
-    kpanic("unexpected FIQ")
-}
-
-@_cdecl("swift_serror_exception")
-func swiftSerrorException(_ esr: UInt64, _ elr: UInt64) -> Never {
-    kprint("\nSERROR  ESR=")
-    kprintHex(esr)
-    kprint("  ELR=")
-    kprintHex(elr)
-    kprint("\n")
-    kpanic("unhandled SError")
-}
-
-/// A vector row the kernel should never take (SP0 / lower EL).
-@_cdecl("swift_unexpected_vector")
-func swiftUnexpectedVector() -> Never {
-    kpanic("unexpected exception vector")
+/// Fatal exception entry for the Vectors.S sync/FIQ/SError/unexpected-vector
+/// stubs: full crash dump via Kernel/Panic.swift (serial + on-screen panic),
+/// then halt. `regs` is the stub's 256-byte snapshot: [0...30] = x0...x30 at
+/// the exception, [31] = the exception-time SP. kind: 0 = sync at EL1,
+/// 1 = FIQ, 2 = SError, 3 = unexpected vector. (Synchronous exceptions from
+/// EL0 do NOT come here — they take swift_sync_lower in
+/// Kernel/Userspace.swift, which services SVCs and kills faulting runs.)
+@_cdecl("swift_fatal_exception")
+func swiftFatalException(_ kind: UInt64, _ esr: UInt64, _ elr: UInt64,
+                         _ far: UInt64, _ spsr: UInt64,
+                         _ regs: UnsafePointer<UInt64>) -> Never {
+    Panic.fatal(kind: kind, esr: esr, elr: elr, far: far, spsr: spsr, regs: regs)
 }

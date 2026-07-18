@@ -32,6 +32,32 @@
 // which Tasks.foldCpuPercent calls once per frame on the main thread
 // (thread context — the IRQ path itself never touches the Tasks registry).
 //
+// Stack overflow canaries: every spawned thread's stack is filled with
+// 0xAA and carries a 16-byte canary (two UInt64 magics) at its BASE.
+// AArch64 stacks grow down, so an overflow clobbers the base last before
+// running off the allocation — the canary is the tripwire. The timer tick
+// audits every live thread's canary every ~100 ms (fixed table walk, two
+// loads per slot, no allocation) and panics the kernel with the offending
+// thread id on the first mismatch; the per-thread panic note is built at
+// spawn (thread context) so the IRQ-side audit never allocates. The boot
+// thread (slot 0) is NOT audited: its stack belongs to Boot.S, which
+// exports no base symbol, so no canary is planted there.
+//
+// Thread lifecycle: entry closures are () -> Never BY CONSTRUCTION —
+// returning is impossible (there is nothing to return to; thread_start
+// parks forever), so a thread that wants out calls Scheduler.exit(), which
+// marks it zombie and switches away for good. kill(id:) does the same to
+// another thread (it refuses the boot thread and the caller). A zombie is
+// never scheduled again (the wake scan only revives .sleeping, the round-
+// robin only picks .runnable); its slot and stack are reclaimed by
+// reapZombies() from idle/kworker THREAD context — never from the IRQ
+// path, since reclaiming frees pages and logs. Note that exit() abandons
+// the thread's call stack mid-flight: nothing unwinds, and any resources
+// the thread held stay held (POSIX pthread_exit semantics, minus cleanup
+// handlers). The abandoned bootstrap frame also keeps one reference to
+// the entry-closure box alive forever — one small box per exited thread,
+// bounded and harmless.
+//
 // Everything here is a no-op unless Config.enableScheduler is true.
 
 @_silgen_name("arm_switch_context")
@@ -49,10 +75,22 @@ enum Scheduler {
     /// Timer ticks a thread may run before preemption (5 x 10 ms = 50 ms).
     static let quantumTicks = 5
 
+    /// Stack-fill pattern (0xAA bytes) and the overflow canary planted at
+    /// the base of every spawned stack (two UInt64 magics, 16 bytes).
+    private static let stackFill: UInt64 = 0xAAAA_AAAA_AAAA_AAAA
+    private static let canaryMagic0: UInt64 = 0xDEAD_BEEF_CAFE_BABE
+    private static let canaryMagic1: UInt64 = 0x5AC1_ED5E_C0FF_EE11
+    /// Canary audit cadence: every 10 timer ticks = ~100 ms.
+    private static let canaryCheckIntervalTicks = 10
+    /// kworker health-loop cadences, in 100 Hz timer ticks.
+    private static let heapValidateIntervalTicks: UInt64 = 1000   // ~10 s
+    private static let heapStatIntervalTicks: UInt64 = 6000       // ~60 s
+
     /// sleeping flips back to runnable from the timer IRQ once
-    /// Interrupts.uptimeTicks() reaches wakeTick.
+    /// Interrupts.uptimeTicks() reaches wakeTick. zombie (exit()/kill())
+    /// never runs again and is reclaimed by reapZombies().
     private enum ThreadState: UInt8 {
-        case runnable, running, sleeping
+        case runnable, running, sleeping, zombie
     }
 
     /// Thread control block. STRICTLY POD — see the file header: no String,
@@ -79,9 +117,17 @@ enum Scheduler {
     /// start. Never touched from the IRQ path or across a switch boundary.
     private static var entries = [(() -> Never)?](repeating: nil, count: maxThreads)
 
+    /// Per-slot panic note for the canary audit ("stack overflow in
+    /// thread N"). Written by spawn/reapZombies in thread context; the
+    /// IRQ-side audit only ever READS it, and only on a canary trip —
+    /// which is terminal (kpanic), so no allocation happens on the IRQ
+    /// path and the read can race with nothing that matters.
+    private static var panicNotes = [String](repeating: "", count: maxThreads)
+
     private static var current = 0
     private static var initialized = false
     private static var ticksSinceSwitch = 0
+    private static var ticksSinceCanaryCheck = 0
 
     // arm_switch_context frame: see the layout comment in Scheduler.S.
     private static let switchFrameSize = 224
@@ -133,36 +179,62 @@ enum Scheduler {
 
     // MARK: - Thread creation
 
-    /// Create a thread: allocate its stack and fabricate an initial switch
-    /// frame so the first context switch to it "returns" into thread_start
-    /// -> entry(). Returns the thread id (table slot), or -1 when the table
+    /// Create a thread: allocate its stack, fill it with 0xAA, plant the
+    /// overflow canary at the base, and fabricate an initial switch frame
+    /// so the first context switch to it "returns" into thread_start ->
+    /// entry(). Returns the thread id (table slot), or -1 when the table
     /// is full or the stack allocation fails. Thread context only — this
     /// allocates (heap page pool + Tasks registry).
+    ///
+    /// Hardening notes:
+    /// - The whole sequence runs with IRQs masked: an unmasked
+    ///   scan...preempt...publish window would let two concurrent spawns
+    ///   double-book the same slot. Everything inside is safe under masked
+    ///   IRQs (heap, Tasks registry and the closure/String stores are all
+    ///   internally IRQ-atomic or plain memory writes).
+    /// - Stack-alloc failure unwinds cleanly to -1: no TCB field, side
+    ///   table, or Tasks registry entry has been touched at that point.
+    /// - A zero-length name registers as "thread".
     @discardableResult
     static func spawn(name: String, stackPages: Int, entry: @escaping () -> Never) -> Int {
         guard Config.enableScheduler, initialized, stackPages > 0 else { return -1 }
         guard let tcbs else { return -1 }
 
-        // Slot 0 belongs to the boot thread. The scan races safely with the
-        // IRQ-side table walk because `used` is published last, after every
-        // other field (single CPU: the IRQ handler observes program order).
+        let daif = armIrqSave()
+        defer { armIrqRestore(daif) }
+
+        // Slot 0 belongs to the boot thread. `used` is published last,
+        // after every other field (single CPU: the IRQ handler observes
+        // program order).
         var slot = -1
         var i = 1
         while i < maxThreads {
             if !tcbs[i].used { slot = i; break }
             i &+= 1
         }
-        guard slot >= 0 else { return -1 }
+        guard slot >= 0 else { return -1 }              // table full
         guard let base = KernelHeap.allocPages(stackPages) else { return -1 }
 
-        let taskID = Tasks.register(name: name,
+        let taskName = name.isEmpty ? "thread" : name
+        let taskID = Tasks.register(name: taskName,
                                     memoryMB: Double(stackPages * 4096) / 1_048_576.0)
 
-        // Fabricated arm_switch_context frame at the stack top: all zero
-        // except the x30 slot -> thread_start (Scheduler.S has the layout).
+        // Fill 0xAA so fresh stack reads back a known pattern, then plant
+        // the canary at the very bottom (overflow tripwire: stacks grow
+        // down), then fabricate the arm_switch_context frame at the top
+        // (Scheduler.S has the layout). The frame sits at the top and the
+        // canary at the base, so zeroing the frame cannot touch it.
         let top = base &+ (UInt(stackPages) << 12)
+        var p = base
+        while p < top {
+            UnsafeMutablePointer<UInt64>(bitPattern: p)!.pointee = stackFill
+            p &+= 8
+        }
+        UnsafeMutablePointer<UInt64>(bitPattern: base)!.pointee = canaryMagic0
+        UnsafeMutablePointer<UInt64>(bitPattern: base &+ 8)!.pointee = canaryMagic1
+
         let sp0 = top &- UInt(switchFrameSize)
-        var p = sp0
+        p = sp0
         while p < top {
             UnsafeMutablePointer<UInt64>(bitPattern: p)!.pointee = 0
             p &+= 8
@@ -179,6 +251,7 @@ enum Scheduler {
         tcbs[slot].accountedTicks = 0
         tcbs[slot].taskID = taskID
         entries[slot] = entry               // thread-context side table
+        panicNotes[slot] = "stack overflow in thread \(slot)"
         tcbs[slot].used = true              // publish last
         return slot
     }
@@ -218,12 +291,97 @@ enum Scheduler {
     /// Table slot of the currently running thread (0 = boot/main thread).
     static var currentThreadID: Int { current }
 
+    // MARK: - Thread termination (exit / kill / reap)
+
+    /// Terminate the CALLING thread: mark it zombie and switch away for
+    /// good. The slot stays allocated until reapZombies() reclaims it from
+    /// idle/kworker thread context. This is the only way out of a thread —
+    /// entry closures are () -> Never by construction, so "returning" is
+    /// impossible; a thread that is done calls exit(). Abandons the call
+    /// stack mid-flight: nothing unwinds, held resources stay held.
+    static func exit() -> Never {
+        guard Config.enableScheduler, initialized, let tcbs else {
+            while true { armWfi() }
+        }
+        let me = current
+        if me == 0 {
+            kpanic("scheduler: boot thread cannot exit")
+        }
+        let daif = armIrqSave()
+        tcbs[me].state = .zombie        // switchToNextRunnable only revives .running
+        switchToNextRunnable()
+        // Unreachable: a zombie is never selected again. If a bug ever
+        // lets the switch return, park instead of running dead code.
+        armIrqRestore(daif)
+        while true { armWfi() }
+    }
+
+    /// Mark ANOTHER thread zombie: it is never scheduled again and the
+    /// reaper reclaims its slot. Refuses the boot thread (id 0) and the
+    /// caller itself (a thread that wants out uses exit()) by returning
+    /// false; also false for unused or already-zombie slots. The target is
+    /// by definition not running (single CPU, caller != target), so
+    /// flipping its state is safe wherever it is parked — mid-yield,
+    /// sleeping, or freshly spawned.
+    @discardableResult
+    static func kill(id: Int) -> Bool {
+        guard Config.enableScheduler, initialized, let tcbs else { return false }
+        guard id > 0, id < maxThreads, id != current else { return false }
+        let daif = armIrqSave()
+        if tcbs[id].used, tcbs[id].state != .zombie {
+            tcbs[id].state = .zombie    // the wake scan only revives .sleeping
+            tcbs[id].wakeTick = 0
+            armIrqRestore(daif)
+            return true
+        }
+        armIrqRestore(daif)
+        return false
+    }
+
+    /// Reclaim every zombie slot: clear the TCB and side tables, free the
+    /// stack pages, unregister the task, and log the reclaim. THREAD
+    /// CONTEXT ONLY (frees memory, releases references, klogs) — called
+    /// from the idle and kworker loops, never from the IRQ path. Two
+    /// reapers may run concurrently: the claim (used+zombie -> cleared
+    /// slot) happens in one IRQ-masked section, so exactly one reaper wins
+    /// each zombie, and spawn/canary/accounting scans never observe a
+    /// half-torn-down slot. The stack free happens AFTER the slot stops
+    /// being visible, so the canary audit can never read freed pages.
+    private static func reapZombies() {
+        guard Config.enableScheduler, initialized, let tcbs else { return }
+        var i = 1                       // slot 0 (boot thread) can never be a zombie
+        while i < maxThreads {
+            var base: UInt = 0
+            var pages = 0
+            var taskID = 0
+            var found = false
+            let daif = armIrqSave()
+            if tcbs[i].used, tcbs[i].state == .zombie {
+                found = true
+                base = tcbs[i].stackBase
+                pages = tcbs[i].stackPages
+                taskID = tcbs[i].taskID
+                entries[i] = nil
+                panicNotes[i] = ""
+                tcbs[i] = TCB()         // whole-slot reset, published atomically
+            }
+            armIrqRestore(daif)
+            if found {
+                KernelHeap.freePages(base, count: pages)
+                Tasks.unregister(id: taskID)
+                klog("[sched] reaped thread \(i) (task \(taskID)) — slot free")
+            }
+            i &+= 1
+        }
+    }
+
     // MARK: - Timer IRQ hook (IRQ CONTEXT: counters + fixed-table writes only)
 
     /// Called from Interrupts.handleIrq on every timer tick, after the GIC
     /// EOI. Accounts one tick to the running thread, wakes due sleepers,
-    /// and preempts round-robin every quantumTicks. Zero allocation, and
-    /// only raw loads/stores on the TCB table.
+    /// audits stack canaries every ~100 ms, and preempts round-robin every
+    /// quantumTicks. Zero allocation, and only raw loads/stores on the TCB
+    /// table (plus, on a canary trip, a terminal kpanic).
     static func onTimerTick() {
         guard Config.enableScheduler, initialized, let tcbs else { return }
 
@@ -238,10 +396,40 @@ enum Scheduler {
             i &+= 1
         }
 
+        ticksSinceCanaryCheck &+= 1
+        if ticksSinceCanaryCheck >= canaryCheckIntervalTicks {
+            ticksSinceCanaryCheck = 0
+            checkStackCanaries()
+        }
+
         ticksSinceSwitch &+= 1
         if ticksSinceSwitch >= quantumTicks {
             ticksSinceSwitch = 0
             switchToNextRunnable()
+        }
+    }
+
+    /// IRQ-side stack-canary audit: verify the 16-byte canary at the base
+    /// of every live spawned thread's stack. A mismatch means the thread
+    /// already ran past its stack — fatal, panic immediately. No
+    /// allocation: the message is precomputed per slot at spawn. Slot 0 is
+    /// skipped (boot stack, no canary — Boot.S owns it); zombie slots
+    /// still hold their stacks until reaped and stay audited.
+    private static func checkStackCanaries() {
+        guard let tcbs else { return }
+        var i = 1
+        while i < maxThreads {
+            if tcbs[i].used {
+                let base = tcbs[i].stackBase
+                if base != 0 {
+                    let lo = UnsafeMutablePointer<UInt64>(bitPattern: base)!.pointee
+                    let hi = UnsafeMutablePointer<UInt64>(bitPattern: base &+ 8)!.pointee
+                    if lo != canaryMagic0 || hi != canaryMagic1 {
+                        kpanic(panicNotes[i])
+                    }
+                }
+            }
+            i &+= 1
         }
     }
 
@@ -282,7 +470,9 @@ enum Scheduler {
 
     /// Switch to the next runnable slot after `current`. Caller must have
     /// IRQs masked (the timer IRQ handler always does; yield/sleep use
-    /// armIrqSave). No allocation; raw table loads/stores only.
+    /// armIrqSave). No allocation; raw table loads/stores only. Zombies are
+    /// never selected (they are not .runnable), and a .zombie prev is left
+    /// zombie — only a .running prev is demoted back to .runnable.
     private static func switchToNextRunnable() {
         guard let tcbs else { return }
         var next = current
@@ -306,17 +496,45 @@ enum Scheduler {
 
     // MARK: - Built-in threads
 
-    /// Idle thread: park in wfi. Never sleeps in scheduler terms, so the
-    /// round-robin always has at least one runnable thread.
+    /// Idle thread: reclaim zombie slots, then park in wfi. Never sleeps
+    /// in scheduler terms, so the round-robin always has at least one
+    /// runnable thread — and the reaper therefore runs at least once per
+    /// scheduling round.
     private static func idleMain() -> Never {
-        while true { armWfi() }
+        while true {
+            reapZombies()
+            armWfi()
+        }
     }
 
-    /// Demo kernel worker: quietly bump a counter once a second.
+    /// Kernel worker: second reaper (a killed idle thread must not stop
+    /// zombie reclaim), the demo once-a-second counter, and the heap
+    /// health loop — KernelHeap.validate() every ~10 s (a failure is
+    /// logged exactly once, then the latch silences repeats) and a
+    /// one-line heap stat every ~60 s.
     private static func kworkerMain() -> Never {
+        var ticksSinceValidate: UInt64 = 0
+        var ticksSinceStat: UInt64 = 0
+        var heapFailureReported = false
         while true {
             kworkerCounter &+= 1
-            sleep(ticks: 100)
+            reapZombies()
+            ticksSinceValidate &+= 100
+            ticksSinceStat &+= 100
+            if ticksSinceValidate >= heapValidateIntervalTicks {
+                ticksSinceValidate = 0
+                if !KernelHeap.validate(), !heapFailureReported {
+                    heapFailureReported = true
+                    klog("[kworker] heap validation FAILED")
+                }
+            }
+            if ticksSinceStat >= heapStatIntervalTicks {
+                ticksSinceStat = 0
+                let usedMiB = KernelHeap.usedBytes / 1_048_576
+                let freeMiB = KernelHeap.freePageCount * 4096 / 1_048_576
+                klog("[kworker] heap used=\(usedMiB) MiB free=\(freeMiB) MiB")
+            }
+            sleep(ticks: 100)               // ~1 s cadence
         }
     }
 }

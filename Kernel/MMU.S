@@ -1,5 +1,6 @@
 // System-register accessors for Kernel/MMU.swift.
-// Called only from MMU.initMMU() during boot — not IRQ-safe, not reentrant.
+// Called from MMU.initMMU() at boot and from allowEL0's table-sync path —
+// not IRQ-safe, not reentrant.
 
 .globl mmu_read_id_aa64mmfr0
 mmu_read_id_aa64mmfr0:

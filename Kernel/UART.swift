@@ -11,6 +11,11 @@ private enum PL011 {
 }
 
 enum UART {
+    /// Bytes dropped because the TX FIFO stayed full past the poll cap —
+    /// i.e. the host end of the serial line stopped draining. Logging must
+    /// never wedge the kernel, so a stalled FIFO costs bytes, not the boot.
+    static private(set) var droppedTx: Int = 0
+
     static func initUART() {
         mmioWrite32(PL011.cr, 0)                    // disable
         mmioWrite32(PL011.ibrd, 13)                 // 24 MHz / (16 * 115200) = 13.02
@@ -20,7 +25,16 @@ enum UART {
     }
 
     static func putc(_ c: UInt8) {
-        while mmioRead32(PL011.fr) & (1 << 5) != 0 { } // TXFF
+        // Bounded wait on TXFF: if the host serial stops draining, drop the
+        // byte and count it instead of spinning forever (panic paths too).
+        var spins = 0
+        while mmioRead32(PL011.fr) & (1 << 5) != 0 { // TXFF
+            spins += 1
+            if spins >= 1_000_000 {
+                droppedTx += 1
+                return
+            }
+        }
         mmioWrite32(PL011.dr, UInt32(c))
     }
 
@@ -40,8 +54,12 @@ enum BootLog {
     static private(set) var lines: [String] = []
 
     static func add(_ s: String) {
+        // klog is called from multiple threads (reaper, kworker): guard the
+        // buffer against concurrent mutation.
+        let flags = armIrqSave()
         lines.append(s)
         if lines.count > 128 { lines.removeFirst() }
+        armIrqRestore(flags)
     }
 }
 

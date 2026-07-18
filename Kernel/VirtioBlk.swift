@@ -47,6 +47,9 @@ private func bstore64(_ a: UInt, _ v: UInt64) {
 enum BlockDev {
     /// Total 512-byte sectors, valid after a successful initBlockDev().
     static private(set) var blockCount: UInt64 = 0
+    /// Device faults contained at runtime (timeouts / ring desyncs that
+    /// forced a full device reset). Diagnostics only; never reset to 0.
+    static private(set) var errorCount: Int = 0
 
     private static let mmioBase: UInt = 0x0A00_0000
     private static let slotStride: UInt = 0x200
@@ -119,10 +122,52 @@ enum BlockDev {
         return false
     }
 
-    /// Legacy virtio bring-up: status handshake, then vring 0 setup.
+    // virtio status register bits.
+    private static let stAck: UInt32 = 1
+    private static let stDriver: UInt32 = 2
+    private static let stOK: UInt32 = 4
+    private static let stFeatOK: UInt32 = 8
+
+    /// Legacy virtio bring-up: bounded reset, status handshake, then vring 0
+    /// setup. Any validation failure returns false — the block subsystem
+    /// stays absent (RAM-only boot) instead of trusting a misbehaving device.
     private static func setupDevice(base b: UInt) -> Bool {
-        let stAck: UInt32 = 1, stDriver: UInt32 = 2, stOK: UInt32 = 4, stFeatOK: UInt32 = 8
-        mmioWrite32(b + R.status, 0)                        // reset
+        guard resetDevice(b) else {
+            klog("[blk] device did not complete reset")
+            return false
+        }
+        handshake(b)
+
+        mmioWrite32(b + R.guestPageSize, 4096)
+        mmioWrite32(b + R.queueSel, 0)                      // queue 0 = requestq
+        let qmax = mmioRead32(b + R.queueNumMax)
+        guard qmax >= 4 else { return false }               // need 3-desc chains
+        qsize = UInt16(min(qmax, 8))
+
+        // Vring: descriptor table (qsize*16 B) + avail ring in page 0, used
+        // ring at +4096 (QueueAlign). The request header and status byte
+        // share the slack in page 0 (well past the avail ring). The pages are
+        // allocated once here and reused by every later recovery reset.
+        guard let vq = KernelHeap.allocPages(2) else { return false }
+        descBase = vq
+        bringUpQueue(b)
+        return true
+    }
+
+    /// Full device reset: Status=0, then a BOUNDED poll for reset-complete —
+    /// a device that never clears Status must not hang boot or recovery.
+    private static func resetDevice(_ b: UInt) -> Bool {
+        mmioWrite32(b + R.status, 0)
+        var spins = 0
+        while mmioRead32(b + R.status) != 0 {
+            spins += 1
+            if spins >= 1_000_000 { return false }
+        }
+        return true
+    }
+
+    /// Status handshake up to FEATURES_OK (we negotiate no features).
+    private static func handshake(_ b: UInt) {
         mmioWrite32(b + R.status, stAck)
         mmioWrite32(b + R.status, stAck | stDriver)
         _ = mmioRead32(b + R.hostFeatures)                  // we require nothing
@@ -130,27 +175,22 @@ enum BlockDev {
         // FEATURES_OK is optional on the legacy interface; continue either way.
         mmioWrite32(b + R.status, stAck | stDriver | stFeatOK)
         _ = mmioRead32(b + R.status)
+    }
 
+    /// (Re)program queue 0 on the already-allocated vring pages and set the
+    /// device live. Shared by setupDevice() and runtime fault recovery.
+    private static func bringUpQueue(_ b: UInt) {
         mmioWrite32(b + R.guestPageSize, 4096)
-        mmioWrite32(b + R.queueSel, 0)                      // queue 0 = requestq
-        let qmax = mmioRead32(b + R.queueNumMax)
-        guard qmax >= 4 else { return false }               // need 3-desc chains
-        let qs = UInt16(min(qmax, 8))
-        mmioWrite32(b + R.queueNum, UInt32(qs))
+        mmioWrite32(b + R.queueSel, 0)
+        mmioWrite32(b + R.queueNum, UInt32(qsize))
         mmioWrite32(b + R.queueAlign, 4096)
 
-        // Vring: descriptor table (qs*16 B) + avail ring in page 0, used ring
-        // at +4096 (QueueAlign). The request header and status byte share the
-        // slack in page 0 (well past the avail ring).
-        guard let vq = KernelHeap.allocPages(2) else { return false }
+        let vq = descBase
         zeroRegion(vq, 2 * 4096)
-
-        descBase = vq
-        availBase = vq + UInt(qs) * 16
+        availBase = vq + UInt(qsize) * 16
         usedBase = vq + 4096
         hdrAddr = vq + 0x800
         statusAddr = vq + 0x810
-        qsize = qs
         availIdx = 0
         lastUsed = 0
         mmioWrite32(b + R.queuePFN, UInt32(vq / 4096))
@@ -160,7 +200,22 @@ enum BlockDev {
         // Acknowledge any stale interrupt, then go live.
         mmioWrite32(b + R.interruptACK, mmioRead32(b + R.interruptStatus))
         mmioWrite32(b + R.status, stAck | stDriver | stFeatOK | stOK)
-        return true
+    }
+
+    /// Contain a runtime device fault: full device reset + queue re-init on
+    /// the existing vring pages, counted in errorCount, then carry on. Never
+    /// spins forever; if the device refuses to reset, the block subsystem
+    /// goes quiescent (ready=false) and later I/O fails fast.
+    private static func recoverFromFault(_ what: String) {
+        errorCount += 1
+        klog("[blk] \(what) — resetting device")
+        guard resetDevice(base) else {
+            klog("[blk] device reset FAILED — block device disabled")
+            ready = false
+            return
+        }
+        handshake(base)
+        bringUpQueue(base)
     }
 
     private static func zeroRegion(_ base: UInt, _ bytes: Int) {
@@ -174,27 +229,60 @@ enum BlockDev {
     // MARK: - Sector I/O
 
     /// Reads `count` 512-byte sectors starting at `lba` into `into`
-    /// (must point at count*512 contiguous bytes). Polls until done.
+    /// (must point at count*512 contiguous bytes). Polls (bounded) until
+    /// done; on a device fault the device is fully reset and the request
+    /// retried ONCE — callers see false only for persistent failures.
     static func readBlocks(_ lba: UInt64, _ count: UInt32, into: UnsafeMutableRawPointer) -> Bool {
-        doRequest(type: tIn, lba: lba, count: count,
-                  buf: UInt(bitPattern: into), deviceWritesData: true)
-    }
-
-    /// Writes `count` 512-byte sectors starting at `lba` from `from`.
-    static func writeBlocks(_ lba: UInt64, _ count: UInt32, from: UnsafeRawPointer) -> Bool {
-        doRequest(type: tOut, lba: lba, count: count,
-                  buf: UInt(bitPattern: from), deviceWritesData: false)
-    }
-
-    /// Submit one request as a 3-descriptor chain in descriptors 0-2 and spin
-    /// on the used ring. Only one request is ever in flight.
-    private static func doRequest(type: UInt32, lba: UInt64, count: UInt32,
-                                  buf: UInt, deviceWritesData: Bool) -> Bool {
         guard ready, count > 0 else { return false }
         guard lba + UInt64(count) <= blockCount else {
             klog("[blk] request out of range: lba \(lba) count \(count)")
             return false
         }
+        let buf = UInt(bitPattern: into)
+        guard let fault = doRequest(type: tIn, lba: lba, count: count,
+                                    buf: buf, deviceWritesData: true) else {
+            return true                                     // nil = success
+        }
+        recoverFromFault(fault)
+        if let again = doRequest(type: tIn, lba: lba, count: count,
+                                 buf: buf, deviceWritesData: true) {
+            klog("[blk] read retry failed: \(again)")
+            return false
+        }
+        return true
+    }
+
+    /// Writes `count` 512-byte sectors starting at `lba` from `from`.
+    /// Same reset + single-retry containment as readBlocks.
+    static func writeBlocks(_ lba: UInt64, _ count: UInt32, from: UnsafeRawPointer) -> Bool {
+        guard ready, count > 0 else { return false }
+        guard lba + UInt64(count) <= blockCount else {
+            klog("[blk] request out of range: lba \(lba) count \(count)")
+            return false
+        }
+        let buf = UInt(bitPattern: from)
+        guard let fault = doRequest(type: tOut, lba: lba, count: count,
+                                    buf: buf, deviceWritesData: false) else {
+            return true
+        }
+        recoverFromFault(fault)
+        if let again = doRequest(type: tOut, lba: lba, count: count,
+                                 buf: buf, deviceWritesData: false) {
+            klog("[blk] write retry failed: \(again)")
+            return false
+        }
+        return true
+    }
+
+    /// Submit one request as a 3-descriptor chain in descriptors 0-2 and spin
+    /// (bounded) on the used ring. Only one request is ever in flight.
+    /// Returns nil on success, or a fault description — the caller then
+    /// resets the device and may retry once. Ring contents are validated
+    /// before anything the device wrote is trusted, and after a fault is
+    /// detected nothing here touches the rings again.
+    private static func doRequest(type: UInt32, lba: UInt64, count: UInt32,
+                                  buf: UInt, deviceWritesData: Bool) -> String? {
+        guard ready else { return "device not ready" }
 
         // Header: struct virtio_blk_outhdr { u32 type; u32 ioprio; u64 sector }.
         mmioWrite32(hdrAddr, type)
@@ -225,20 +313,34 @@ enum BlockDev {
         while bload16(usedBase + 2) == lastUsed {
             spins += 1
             if spins > 100_000_000 {
-                klog("[blk] TIMEOUT waiting for request completion")
-                return false
+                return "request timeout"
             }
         }
+
+        // Ring validation before trusting anything the device wrote: the used
+        // idx must have advanced monotonically by at most qsize, the used
+        // element must reference a descriptor we own, and its byte count must
+        // fit this chain's device-writable buffers (data on reads, the status
+        // byte always). A violation means the ring is desynced; consuming it
+        // could silently corrupt kernel memory.
+        let usedIdx = bload16(usedBase + 2)
+        let delta = usedIdx &- lastUsed
+        guard delta >= 1, delta <= qsize else { return "ring desync" }
+        let elem = usedBase + 4 + UInt(lastUsed % qsize) * 8
+        let id = mmioRead32(elem)
+        let usedLen = mmioRead32(elem + 4)
+        let maxWritten = UInt32(deviceWritesData ? count * UInt32(sectorSize) : 0) + 1
+        guard id < UInt32(qsize), usedLen <= maxWritten else { return "ring desync" }
+
         lastUsed &+= 1
         // Ack the (masked) interrupt to keep the device state tidy.
         mmioWrite32(base + R.interruptACK, mmioRead32(base + R.interruptStatus))
 
         let status = bload8(statusAddr)
         if status != sOK {
-            klog("[blk] request failed, status \(status)")
-            return false
+            return "request failed, status \(status)"
         }
-        return true
+        return nil
     }
 
     private static func setDesc(_ i: UInt16, addr: UInt, len: UInt32, flags: UInt16, next: UInt16) {

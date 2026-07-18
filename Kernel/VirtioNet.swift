@@ -56,6 +56,9 @@ private func nstore64(_ a: UInt, _ v: UInt64) {
 enum NetDev {
     /// True after a successful initNetDev().
     static private(set) var ready = false
+    /// Device faults contained at runtime (ring desyncs / tx timeouts that
+    /// forced a full device reset). Diagnostics only; never reset to 0.
+    static private(set) var errorCount: Int = 0
     /// Our MAC, 6 bytes packed big-endian into the low 48 bits
     /// (byte 0 of the address is bits 47...40). Broadcast is all-ones.
     static private(set) var mac: UInt64 = 0
@@ -151,17 +154,21 @@ enum NetDev {
         return s
     }
 
-    /// Legacy virtio bring-up: status handshake, then both vrings + rx buffers.
+    // virtio status register bits.
+    private static let stAck: UInt32 = 1
+    private static let stDriver: UInt32 = 2
+    private static let stOK: UInt32 = 4
+    private static let stFeatOK: UInt32 = 8
+
+    /// Legacy virtio bring-up: bounded reset, status handshake, then both
+    /// vrings + rx buffers. Any validation failure returns false — the net
+    /// subsystem stays absent instead of trusting a misbehaving device.
     private static func setupDevice(base b: UInt) -> Bool {
-        let stAck: UInt32 = 1, stDriver: UInt32 = 2, stOK: UInt32 = 4, stFeatOK: UInt32 = 8
-        mmioWrite32(b + NReg.status, 0)                     // reset
-        mmioWrite32(b + NReg.status, stAck)
-        mmioWrite32(b + NReg.status, stAck | stDriver)
-        _ = mmioRead32(b + NReg.hostFeatures)               // we require nothing
-        mmioWrite32(b + NReg.guestFeatures, 0)
-        // FEATURES_OK is optional on the legacy interface; continue either way.
-        mmioWrite32(b + NReg.status, stAck | stDriver | stFeatOK)
-        _ = mmioRead32(b + NReg.status)
+        guard resetDevice(b) else {
+            klog("[net] device did not complete reset")
+            return false
+        }
+        handshake(b)
 
         mmioWrite32(b + NReg.guestPageSize, 4096)
 
@@ -174,21 +181,60 @@ enum NetDev {
         guard qs >= 2 else { return false }
         qsize = UInt16(qs)
 
-        // --- queue 0 (receiveq): vring (2 pages) + buffer pages -----------
+        // Queue + buffer pages, allocated once and reused by every later
+        // recovery reset.
         guard let rxq = KernelHeap.allocPages(2) else { return false }
-        zeroRegion(rxq, 2 * 4096)
         let bufPages = (Int(qsize) * Int(rxBufLen) + 4095) / 4096
         guard let rxb = KernelHeap.allocPages(bufPages) else { return false }
-        zeroRegion(rxb, bufPages * 4096)
-
+        guard let txq = KernelHeap.allocPages(2) else { return false }
+        guard let txb = KernelHeap.allocPages(1) else { return false }
         rxDesc = rxq
-        rxAvail = rxq + UInt(qsize) * 16
-        rxUsed = rxq + 4096
         rxBufs = rxb
+        txDesc = txq
+        txBuf = txb
+        bringUpQueues(b)
+        return true
+    }
+
+    /// Full device reset: Status=0, then a BOUNDED poll for reset-complete —
+    /// a device that never clears Status must not hang boot or recovery.
+    private static func resetDevice(_ b: UInt) -> Bool {
+        mmioWrite32(b + NReg.status, 0)
+        var spins = 0
+        while mmioRead32(b + NReg.status) != 0 {
+            spins += 1
+            if spins >= 1_000_000 { return false }
+        }
+        return true
+    }
+
+    /// Status handshake up to FEATURES_OK (we negotiate no features).
+    private static func handshake(_ b: UInt) {
+        mmioWrite32(b + NReg.status, stAck)
+        mmioWrite32(b + NReg.status, stAck | stDriver)
+        _ = mmioRead32(b + NReg.hostFeatures)               // we require nothing
+        mmioWrite32(b + NReg.guestFeatures, 0)
+        // FEATURES_OK is optional on the legacy interface; continue either way.
+        mmioWrite32(b + NReg.status, stAck | stDriver | stFeatOK)
+        _ = mmioRead32(b + NReg.status)
+    }
+
+    /// (Re)program both queues on the already-allocated pages, repost every
+    /// rx buffer, and set the device live. Shared by setupDevice() and
+    /// runtime fault recovery.
+    private static func bringUpQueues(_ b: UInt) {
+        mmioWrite32(b + NReg.guestPageSize, 4096)
+
+        // --- queue 0 (receiveq): vring (2 pages) + buffer pages -----------
+        zeroRegion(rxDesc, 2 * 4096)
+        let bufPages = (Int(qsize) * Int(rxBufLen) + 4095) / 4096
+        zeroRegion(rxBufs, bufPages * 4096)
+        rxAvail = rxDesc + UInt(qsize) * 16
+        rxUsed = rxDesc + 4096
         mmioWrite32(b + NReg.queueSel, 0)
         mmioWrite32(b + NReg.queueNum, UInt32(qsize))
         mmioWrite32(b + NReg.queueAlign, 4096)
-        mmioWrite32(b + NReg.queuePFN, UInt32(rxq / 4096))
+        mmioWrite32(b + NReg.queuePFN, UInt32(rxDesc / 4096))
 
         nstore16(rxAvail, 1)  // VIRTQ_AVAIL_F_NO_INTERRUPT — we poll
         var i: UInt16 = 0
@@ -207,19 +253,14 @@ enum NetDev {
         rxLastUsed = 0
 
         // --- queue 1 (transmitq): vring (2 pages) + one frame buffer -------
-        guard let txq = KernelHeap.allocPages(2) else { return false }
-        zeroRegion(txq, 2 * 4096)
-        guard let txb = KernelHeap.allocPages(1) else { return false }
-        zeroRegion(txb, 4096)
-
-        txDesc = txq
-        txAvail = txq + UInt(qsize) * 16
-        txUsed = txq + 4096
-        txBuf = txb
+        zeroRegion(txDesc, 2 * 4096)
+        zeroRegion(txBuf, 4096)
+        txAvail = txDesc + UInt(qsize) * 16
+        txUsed = txDesc + 4096
         mmioWrite32(b + NReg.queueSel, 1)
         mmioWrite32(b + NReg.queueNum, UInt32(qsize))
         mmioWrite32(b + NReg.queueAlign, 4096)
-        mmioWrite32(b + NReg.queuePFN, UInt32(txq / 4096))
+        mmioWrite32(b + NReg.queuePFN, UInt32(txDesc / 4096))
 
         nstore16(txAvail, 1)  // VIRTQ_AVAIL_F_NO_INTERRUPT — we poll
         txAvailIdx = 0
@@ -230,7 +271,22 @@ enum NetDev {
         mmioWrite32(b + NReg.status, stAck | stDriver | stFeatOK | stOK)
         armDsbSy()
         mmioWrite32(b + NReg.queueNotify, 0)
-        return true
+    }
+
+    /// Contain a runtime device fault: full device reset + queue re-init on
+    /// the existing pages (all rx buffers reposted), counted in errorCount,
+    /// then carry on. Never spins forever; if the device refuses to reset,
+    /// the net subsystem goes quiescent (ready=false) and tx fails fast.
+    private static func recoverFromFault(_ what: String) {
+        errorCount += 1
+        klog("[net] \(what) — resetting device")
+        guard resetDevice(base) else {
+            klog("[net] device reset FAILED — network device disabled")
+            ready = false
+            return
+        }
+        handshake(base)
+        bringUpQueues(base)
     }
 
     private static func zeroRegion(_ base: UInt, _ bytes: Int) {
@@ -270,15 +326,32 @@ enum NetDev {
         mmioWrite32(base + NReg.queueNotify, 1)
 
         // Spin on the used ring with a bounded timeout (a hung device must
-        // not wedge the kernel).
+        // not wedge the kernel). After a timeout the tx ring state is
+        // unknown — contain it with a full device reset + queue re-init.
         var spins = 0
         while nload16(txUsed + 2) == txLastUsed {
             spins += 1
             if spins > 100_000_000 {
-                klog("[net] TIMEOUT waiting for tx completion")
+                recoverFromFault("tx timeout")
                 return false
             }
         }
+
+        // Ring validation (same contract as pollRx): the used idx must have
+        // advanced monotonically by at most qsize and the used element must
+        // reference a descriptor we own. Anything else is a desync.
+        let usedIdx = nload16(txUsed + 2)
+        let delta = usedIdx &- txLastUsed
+        guard delta >= 1, delta <= qsize else {
+            recoverFromFault("ring desync")
+            return false
+        }
+        let elem = txUsed + 4 + UInt(txLastUsed % qsize) * 8
+        guard mmioRead32(elem) < UInt32(qsize) else {
+            recoverFromFault("ring desync")
+            return false
+        }
+
         txLastUsed &+= 1
         // Ack the (masked) interrupt to keep the device state tidy.
         mmioWrite32(base + NReg.interruptACK, mmioRead32(base + NReg.interruptStatus))
@@ -289,30 +362,43 @@ enum NetDev {
 
     /// Drain the receiveq used ring, handing each frame (without the 10-byte
     /// virtio header) to Net.handleRxFrame, then repost the buffer. Called
-    /// from Net.poll() on the kernel main thread — never IRQ context.
+    /// from Net.poll() on the kernel main thread — never IRQ context. Ring
+    /// contents are validated before use; a desynced ring triggers a full
+    /// device reset + re-init instead of trusting device-written ids/lengths.
     static func pollRx() {
         guard ready else { return }
         let usedIdx = nload16(rxUsed + 2)
+        // The device may only have consumed buffers we posted, so the used
+        // idx must have advanced monotonically by at most qsize.
+        let delta = usedIdx &- rxLastUsed
+        guard delta <= qsize else {
+            recoverFromFault("ring desync")
+            return
+        }
         while rxLastUsed != usedIdx {
             let slot = rxLastUsed % qsize
             let elem = rxUsed + 4 + UInt(slot) * 8
             let id = UInt16(mmioRead32(elem) & 0xFFFF)
             let written = Int(mmioRead32(elem + 4))     // header + frame bytes
-            if id < qsize {
-                if written > hdrLen {
-                    let b = rxBufs + UInt(id) * rxBufLen
-                    let frameLen = min(written - hdrLen, Int(rxBufLen) - hdrLen)
-                    Net.handleRxFrame(UnsafeRawPointer(bitPattern: b + UInt(hdrLen))!,
-                                      frameLen)
-                }
-                // Repost the buffer and kick the device.
-                nstore16(rxAvail + 4 + UInt(rxAvailIdx % qsize) * 2, id)
-                armDsbSy()
-                rxAvailIdx &+= 1
-                nstore16(rxAvail + 2, rxAvailIdx)
-                armDsbSy()
-                mmioWrite32(base + NReg.queueNotify, 0)
+            // The descriptor id must be one we posted and the byte count
+            // must fit the buffer behind it (else the device overran it).
+            guard id < qsize, written <= Int(rxBufLen) else {
+                recoverFromFault("ring desync")
+                return
             }
+            if written > hdrLen {
+                let b = rxBufs + UInt(id) * rxBufLen
+                let frameLen = min(written - hdrLen, Int(rxBufLen) - hdrLen)
+                Net.handleRxFrame(UnsafeRawPointer(bitPattern: b + UInt(hdrLen))!,
+                                  frameLen)
+            }
+            // Repost the buffer and kick the device.
+            nstore16(rxAvail + 4 + UInt(rxAvailIdx % qsize) * 2, id)
+            armDsbSy()
+            rxAvailIdx &+= 1
+            nstore16(rxAvail + 2, rxAvailIdx)
+            armDsbSy()
+            mmioWrite32(base + NReg.queueNotify, 0)
             rxLastUsed &+= 1
         }
     }

@@ -18,7 +18,10 @@ public func stackCheckFail() -> Never {
 @_cdecl("posix_memalign")
 public func posixMemalign(_ memptr: UnsafeMutablePointer<UnsafeMutableRawPointer?>,
                           _ alignment: Int, _ size: Int) -> Int32 {
-    guard let p = KernelHeap.alloc(size: size, alignment: alignment) else { return 12 } // ENOMEM
+    guard let p = KernelHeap.alloc(size: size, alignment: alignment) else {
+        KernelHeap.noteOutOfMemory()    // one-shot '[heap] OUT OF MEMORY' report
+        return 12
+    } // ENOMEM
     memptr.pointee = p
     return 0
 }
