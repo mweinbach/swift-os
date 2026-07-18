@@ -64,10 +64,24 @@ enum BootLog {
 }
 
 // MARK: - kprint family (only safe after KernelHeap.initHeap for klog)
+//
+// Locking: every public entry point serializes on the SMP klog spinlock
+// (klog_lock in Kernel/SMP.S) so partial lines from different cores can't
+// interleave. The spinlock is NON-recursive, so two paths exist:
+//   - the standalone kprint/kprintHex/kprintDec take the lock themselves
+//     around their whole output sequence;
+//   - klog() and smp_secondary_main hold the lock across several writes
+//     and use the *Unlocked helpers — they must NOT call the self-locking
+//     wrappers (re-taking the lock would spin forever).
+// Hierarchy (see Kernel/Locks.swift): sched/tasks > klog > heap. klog's
+// BootLog.add allocates under this lock — legal, the heap lock is lower.
 
-func kprint(_ s: String) { UART.write(s) }
+/// UART write with NO locking: the caller MUST already hold the klog lock
+/// (klog and smp_secondary_main do).
+func kprintUnlocked(_ s: String) { UART.write(s) }
 
-func kprintHex(_ v: UInt64) {
+/// Hex dump, `0x` + 16 digits, with NO locking: caller holds the klog lock.
+func kprintHexUnlocked(_ v: UInt64) {
     let digits: [UInt8] = [48,49,50,51,52,53,54,55,56,57,97,98,99,100,101,102]
     UART.write("0x")
     var shift = 60
@@ -77,10 +91,32 @@ func kprintHex(_ v: UInt64) {
     }
 }
 
-func kprintDec(_ v: Int64) {
-    if v < 0 { UART.write("-") ; kprintDec(-v); return }
-    if v >= 10 { kprintDec(v / 10) }
+/// Decimal, with NO locking: caller holds the klog lock.
+func kprintDecUnlocked(_ v: Int64) {
+    if v < 0 { UART.write("-") ; kprintDecUnlocked(-v); return }
+    if v >= 10 { kprintDecUnlocked(v / 10) }
     UART.putc(UInt8(48 + v % 10))
+}
+
+func kprint(_ s: String) {
+    let lock = armKlogLockAddr()
+    armSpinLock(lock)
+    kprintUnlocked(s)
+    armSpinUnlock(lock)
+}
+
+func kprintHex(_ v: UInt64) {
+    let lock = armKlogLockAddr()
+    armSpinLock(lock)
+    kprintHexUnlocked(v)
+    armSpinUnlock(lock)
+}
+
+func kprintDec(_ v: Int64) {
+    let lock = armKlogLockAddr()
+    armSpinLock(lock)
+    kprintDecUnlocked(v)
+    armSpinUnlock(lock)
 }
 
 /// Log line: serial + boot log buffer (used by the boot splash and /var/log/syslog).
@@ -96,9 +132,6 @@ func klog(_ s: String) {
 }
 
 func kpanic(_ message: String) -> Never {
-    armIrqDisable()
-    UART.write("\n*** KERNEL PANIC: ")
-    UART.write(message)
-    UART.write(" ***\n")
-    while true { armWfi() }
+    // Full panic path: halts the other cores (SGI 1), dumps serial + screen.
+    Panic.halt(message)
 }

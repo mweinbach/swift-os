@@ -19,6 +19,15 @@ What it does:
          -> [input] virtio keyboard -> [net] ipv4 -> login session started
      The order matches the real boot sequence in Kernel/Main.swift (sched ->
      display -> input -> net, all synchronous before the compositor starts).
+     SMP bring-up (SMP.startSecondaries, called between sched and display
+     init) is asserted separately as a WINDOW: each secondary must log one
+     of '[smp] cpu N online' / '[smp] cpu N scheduling' / '[sched] cpu N
+     online' (all three shapes appeared across SMP integration states)
+     after '[sched] scheduler up' and before 'login session started'. The
+     per-cpu lines race each other — a real boot logged cpu 3 BEFORE
+     cpu 2 — so ordered needles would flake; the window check is
+     order-free (and intentionally wider than the observed before-[fb]
+     landing zone, so a straggler print can't flake either).
      The socket uses `wait=on` (NOT the usual `wait=off`): the guest boots in
      well under a second and then goes quiet on serial, so with wait=off every
      boot byte is written before a client can possibly connect and is silently
@@ -42,19 +51,23 @@ What it does:
      already-formatted image, 'fresh image formatted and seeded' /
      'empty image reseeded' for a blank one (both mean write-through is
      live); any 'RAM-only' outcome fails.
-  5. Stress battery: ~30 more injected command lines, most of them
+  5. Stress battery: ~34 more injected command lines, most of them
      `;`-chained compounds (mkdir/echo/mv/cp/cat/rm loops, pipes, append
      redirection), plus the real workloads: ping -c 1 10.0.2.2 (twice, once
      after the filesystem churn), udemo (twice — EL0 re-entry), tree /,
-     du -sh /, find /, man/which lookups, kill 9999 (expect-safe failure),
-     and `top` followed 3 s later by a bare `q` to exercise the terminal's
-     interactive TOP mode entry/exit, then a final `uptime` to prove the
-     shell is responsive again.
+     du -sh /, find /, man/which lookups, kill 9999/9998 (expect-safe
+     failures), the SMP block (smpdemo 3 -> ps with a 3 s settle ->
+     kill 9998 -> smpdemo 2 second round; smpdemo is the SMP shell agent's
+     pinned command — until it lands, the shell's unknown-command path is
+     equally expect-safe), and `top` followed 3 s later by a bare `q` to
+     exercise the terminal's interactive TOP mode entry/exit, then a final
+     `uptime` to prove the shell is responsive again (load averages are
+     visual only — never asserted; shell output goes to the GUI, not serial).
   6. Negative assertions across the WHOLE run (from the first boot byte to
      the last soak key): the serial log must not contain KERNEL PANIC,
-     SYNC EXCEPTION, RECURSIVE FAULT, [heap] bad free, heap validation
-     FAILED, OUT OF MEMORY, or SERROR — the offending line is quoted on
-     failure.
+     SYNC EXCEPTION, RECURSIVE FAULT, stack overflow in thread, CPU_ON
+     failed, [heap] bad free, heap validation FAILED, OUT OF MEMORY, or
+     SERROR — the offending line is quoted on failure.
   7. --soak N: after the batteries, injects randomized-but-seeded command
      sequences plus arrow/escape key bytes for N seconds, asserting QEMU
      stays alive and no crash marker appears (liveness only — no serial
@@ -127,6 +140,22 @@ BOOT_STEPS = [
     (b"login session started", 60.0),
 ]
 
+# SMP bring-up window (SMP.startSecondaries runs between Scheduler and
+# Display init; observed landing zone: just before '[fb] ramfb'). Any ONE of
+# these line shapes proves cpu N came up — all three were observed across
+# SMP integration states today:
+#   '[smp] cpu N online (parked)'   — stage-1 parked secondaries
+#   '[smp] cpu N scheduling'        — mid-integration per-core scheduling
+#   '[sched] cpu N online: idle...' — per-core scheduler's own line
+# The per-cpu lines race each other on the wire (a real boot showed cpu 3
+# before cpu 2), so this is an UNORDERED set check: every cpu must produce
+# one matching line after '[sched] scheduler up' and before 'login session
+# started'.
+SMP_CPUS = (1, 2, 3)
+SMP_LINE_TEMPLATES = ("[smp] cpu {cpu} online",
+                      "[smp] cpu {cpu} scheduling",
+                      "[sched] cpu {cpu} online")
+
 # Storage lines (Userland/VFS.swift Disk.initAndMount) — logged LAZILY on the
 # first VFS access, so asserted after the standard battery, not at boot.
 STORAGE_ONLINE = b"persistent storage online"
@@ -183,6 +212,15 @@ STRESS_BATTERY = [
     ("ping", 2.5),                        # usage error path
     ("ping -c 1 10.0.2.2", 6.0),          # net stack still alive after FS churn
     ("udemo", 4.0),                       # EL0 re-entry
+    # --- SMP block: cross-core spin threads (smpdemo is the SMP shell
+    # agent's pinned command; until it lands the shell's unknown-command
+    # path is equally expect-safe). Spin pids can't be known ahead, so the
+    # kill targets a guaranteed-absent pid. No serial assertions here —
+    # shell output goes to the GUI; this exercises input + scheduler load.
+    ("smpdemo 3", 4.0),                   # spin threads across the cores
+    ("ps", 3.0),                          # 3 s settle: per-core CPU% accrues
+    ("kill 9998", 2.5),                   # no such pid — expect-safe failure
+    ("smpdemo 2", 4.0),                   # second round
     ("echo stress-ok > /tmp/last; cat /tmp/last; rm /tmp/last", 2.5),
     ("top", 3.0),                         # enters TOP mode; bare 'q' follows
 ]
@@ -208,6 +246,8 @@ PANIC_MARKERS = [
     b"KERNEL PANIC",
     b"SYNC EXCEPTION",
     b"RECURSIVE FAULT",
+    b"stack overflow in thread",   # per-thread guard-page / stack-limit check
+    b"CPU_ON failed",              # SMP bring-up: a secondary never came up
     b"[heap] bad free",
     b"heap validation FAILED",
     b"OUT OF MEMORY",
@@ -497,6 +537,8 @@ def boot_pass(tag, display, sock_path, extra_args=(), with_disk=False):
     pump = SerialPump(sock, proc)
 
     pos = 0
+    sched_pos = -1     # end of the '[sched] scheduler up' match (SMP window start)
+    login_idx = -1     # start of the 'login session started' match (window end)
     t_prev = time.monotonic()
     for needle, timeout in BOOT_STEPS:
         idx = pump.wait_for(needle, timeout, pos)
@@ -508,8 +550,31 @@ def boot_pass(tag, display, sock_path, extra_args=(), with_disk=False):
         now = time.monotonic()
         record(f"{tag}: '{needle.decode()}'", True, f"{now - t_prev:.1f}s")
         t_prev = now
+        if needle == b"[sched] scheduler up":
+            sched_pos = idx + len(needle)
+        elif needle == b"login session started":
+            login_idx = idx
         pos = idx + len(needle)
+    check_smp_window(tag, pump, sched_pos, login_idx)
     return True, proc, sock, pump, logf, pos
+
+
+def check_smp_window(tag, pump, from_pos, to_pos):
+    """SMP bring-up assertion: every secondary's line must land inside
+    ( '[sched] scheduler up' .. 'login session started' ). Unordered set
+    check — the per-cpu prints race each other (observed cpu 3 before
+    cpu 2), so ordered needles would flake. Runs after the ordered boot
+    loop, so the whole window is already in the buffer (no waiting)."""
+    window = bytes(pump.buf[from_pos:to_pos])
+    smp_lines = "; ".join(ln for ln in window.decode(errors="replace").splitlines()
+                          if "[smp]" in ln or "[sched] cpu" in ln)
+    for cpu in SMP_CPUS:
+        variants = tuple(t.format(cpu=cpu).encode() for t in SMP_LINE_TEMPLATES)
+        hit = next((v for v in variants if window.find(v) >= 0), None)
+        detail = (f"'{hit.decode()}'" if hit is not None
+                  else f"window has: {smp_lines or 'no [smp] lines at all'}")
+        record(f"{tag}: smp cpu {cpu} up (online|scheduling line before login)",
+               hit is not None, detail)
 
 
 def inject_lines(tag, proc, sock, pump, lines, label):

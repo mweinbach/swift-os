@@ -50,6 +50,8 @@ public final class TerminalApp: OSApp {
     private var topRefreshElapsed: TimeInterval = 0
     /// Latest process snapshot, re-read from Platform.services at each refresh.
     private var topProcesses: [ProcessInfo] = []
+    /// Latest per-core busy fractions (0...1), refreshed alongside topProcesses.
+    private var topCoreLoads: [Double] = []
     /// Default TOP-mode refresh cadence: ~4 Hz.
     private static let defaultTopRefresh: TimeInterval = 0.25
 
@@ -58,8 +60,8 @@ public final class TerminalApp: OSApp {
         "cat", "cd", "clear", "cp", "date", "df", "echo", "env", "exit",
         "free", "grep", "head", "help", "history", "hostname", "kill", "ls",
         "mkdir", "mv", "nano", "ping", "ps", "pwd", "reboot", "rm", "rmdir",
-        "shutdown", "tail", "top", "touch", "tree", "udemo", "uname", "uptime",
-        "whoami", "du",
+        "shutdown", "smpdemo", "tail", "top", "touch", "tree", "udemo",
+        "uname", "uptime", "whoami", "du",
     ]
 
     // MARK: OSApp
@@ -640,17 +642,28 @@ public final class TerminalApp: OSApp {
     private func exitTopMode() {
         topMode = false
         topProcesses = []
+        topCoreLoads = []
         scrollToBottom() // scrollback was never touched: prompt view restored
         resetBlink()
     }
 
     /// Re-reads the real kernel task accounting, sorted htop-style by %CPU
     /// descending (ties by PID ascending so the row order doesn't jitter).
+    /// Also refreshes the per-core busy fractions (KernelServices.perCoreLoad,
+    /// already smoothed; falls back to one synthetic core from the process
+    /// table's total %CPU when the scheduler reports no per-core data).
     private func refreshTopProcesses() {
         topProcesses = Platform.services.processes.sorted {
             $0.cpuPercent != $1.cpuPercent
                 ? $0.cpuPercent > $1.cpuPercent
                 : $0.pid < $1.pid
+        }
+        let loads = Platform.services.perCoreLoad
+        if !loads.isEmpty {
+            topCoreLoads = loads
+        } else {
+            let processCPU = topProcesses.reduce(0) { $0 + $1.cpuPercent }
+            topCoreLoads = [min(1, processCPU / 100)]
         }
     }
 
@@ -708,6 +721,17 @@ public final class TerminalApp: OSApp {
                               suffix: "  tasks " + String(topProcesses.count)
                                   + ", running " + String(running),
                               columns: columns))
+
+        // Per-core mini-line: "cpu0 97% cpu1 88% cpu2 3% cpu3 0%".
+        var coreRow: [Run] = []
+        for (index, load) in topCoreLoads.enumerated() {
+            let percent = Int(load * 100 + 0.5)
+            if !coreRow.isEmpty { coreRow.append((text: " ", color: .darkGray)) }
+            coreRow.append((text: "cpu\(index) ", color: .darkGray))
+            coreRow.append((text: "\(percent)%",
+                            color: TerminalApp.topPercentColor(Double(percent))))
+        }
+        if !coreRow.isEmpty { rows.append(coreRow) }
 
         // MEM bar: '#' used / '-' free, orange like System Monitor.
         let usedMB = services.usedMemoryMB

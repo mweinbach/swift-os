@@ -8,8 +8,10 @@
 // `draw(_:in:)`:
 //   HEADER     ~84px  hostname, OS + kernel release, ticking uptime and load
 //                     average, plus the "Quit Process" button and status flashes.
-//   CPU        ~110px 120-sample @4Hz total-CPU history (filled area + polyline),
-//                     the current total in large text, and 4 per-core bars.
+//   CPU        ~110px 120-sample @4Hz mean-per-core CPU history (filled area +
+//                     polyline), the multi-core total in large text (Linux
+//                     style: one busy core = 100%), and real per-core bars
+//                     (KernelServices.perCoreLoad / Scheduler.perCoreUsage).
 //   MEMORY     ~56px  used/total bar (green base, orange used) + GB text.
 //   PROCESSES  rest    sortable, scrollable process table; click selects a row,
 //                     "q" or the button kills the selected process's window.
@@ -30,17 +32,14 @@ public final class SystemMonitorApp: OSApp {
     private var selectedPID: Int?
 
     // CPU history: true ring buffer, newest sample appended at the head.
+    // Samples are the MEAN per-core busy fraction (0...100) so the graph
+    // keeps its 0-100% scale now that the header total is multi-core.
     private let historyCapacity = 120
     private var history: [Double]
     private var historyHead = 0   // index of the oldest sample, once the buffer is full
     private var historyCount = 0
     private var sampleAccumulator: TimeInterval = 0
     private let sampleInterval: TimeInterval = 0.25 // 4 Hz
-    private var perCore: [Double] = [0, 0, 0, 0]
-
-    // Cosmetic jitter source for the per-core split. Double.random needs an OS
-    // entropy source the kernel doesn't have, so we carry a tiny xorshift64*.
-    private var rngState: UInt64 = 0x9E37_79B9_7F4A_7C15
 
     // Process table scrolling (points)
     private var scrollOffset: CGFloat = 0
@@ -110,12 +109,12 @@ public final class SystemMonitorApp: OSApp {
     }
 
     public override func tick(_ dt: TimeInterval) {
-        // Sample total CPU at ~4Hz into the ring buffer.
+        // Sample mean per-core CPU at ~4Hz into the ring buffer.
         sampleAccumulator += dt
         while sampleAccumulator >= sampleInterval {
             sampleAccumulator -= sampleInterval
-            pushSample(currentTotalCPU())
-            jitterCores()
+            let cores = coreLoads()
+            pushSample(cores.reduce(0, +) * 100 / Double(cores.count))
         }
         // Platform.services.processes is re-read every frame in draw(); here we
         // only drop the selection if its process vanished (e.g. it was killed).
@@ -178,23 +177,26 @@ public final class SystemMonitorApp: OSApp {
     // MARK: - CPU
 
     private func drawCPU(_ s: Surface, _ r: CGRect, _ pad: CGFloat) {
-        let total = currentTotalCPU()
+        let cores = coreLoads()
+        let total = cores.reduce(0, +) * 100 // 0...(100 x coreCount)
         s.text("CPU", at: CGPoint(x: r.minX + pad, y: r.minY + 8), color: .gray)
 
-        // Right column: current total in large text + 4 per-core bars.
+        // Right column: current total in large text (Linux-style: one busy
+        // core = 100%, so 4 pegged cores read 400%) + real per-core bars.
         let colW: CGFloat = 128
         let colX = r.maxX - pad - colW
         s.text(NumFmt.fixed(total, 0) + "%", at: CGPoint(x: colX, y: r.minY + 12),
                color: .titleText, scale: 2)
-        var barY = r.minY + 46
-        for core in 0..<4 {
+        s.text("(\(cores.count) cores)", at: CGPoint(x: colX, y: r.minY + 46), color: .gray)
+        var barY = r.minY + 62
+        for core in 0..<min(4, cores.count) {
             let barRect = CGRect(x: colX, y: barY, width: colW, height: 9)
             s.fill(barRect, color: .black.withAlpha(0.35))
-            let frac = CGFloat(min(100, max(0, perCore[core])) / 100)
+            let frac = CGFloat(min(1, max(0, cores[core])))
             if frac > 0 {
                 s.fill(CGRect(x: colX, y: barY, width: colW * frac, height: 9), color: .accent)
             }
-            barY += 14
+            barY += 12
         }
 
         // History graph: filled area (thin vertical rects) + polyline on top.
@@ -424,8 +426,15 @@ public final class SystemMonitorApp: OSApp {
 
     // MARK: - Sampling
 
-    private func currentTotalCPU() -> Double {
-        min(100, Platform.services.processes.reduce(0) { $0 + $1.cpuPercent })
+    /// Real per-core busy fractions (0...1) from the kernel
+    /// (KernelServices.perCoreLoad — fed by Scheduler.perCoreUsage and
+    /// lightly smoothed there). Fallback when the scheduler reports no
+    /// per-core data: one synthetic core from the process table's %CPU.
+    private func coreLoads() -> [Double] {
+        let loads = Platform.services.perCoreLoad
+        if !loads.isEmpty { return loads }
+        let processCPU = Platform.services.processes.reduce(0) { $0 + $1.cpuPercent }
+        return [min(1, processCPU / 100)]
     }
 
     private func pushSample(_ value: Double) {
@@ -441,34 +450,6 @@ public final class SystemMonitorApp: OSApp {
     /// Oldest-first access into the ring buffer; `index` must be < historyCount.
     private func sampleAt(_ index: Int) -> Double {
         history[(historyHead + index) % historyCapacity]
-    }
-
-    /// Split the sampled total across 4 fake cores with jitter + smoothing.
-    private func jitterCores() {
-        let total = historyCount > 0 ? sampleAt(historyCount - 1) : 0
-        var weights = [Double](repeating: 0, count: 4)
-        var sum = 0.0
-        for i in 0..<4 {
-            weights[i] = 0.5 + nextRandom() // was Double.random(in: 0.5...1.5)
-            sum += weights[i]
-        }
-        for i in 0..<4 {
-            let jitter = nextRandom() * 4 - 2 // was Double.random(in: -2...2)
-            let target = min(100, max(0, total * (weights[i] / sum) * 4 + jitter))
-            perCore[i] = perCore[i] * 0.45 + target * 0.55
-        }
-    }
-
-    /// xorshift64* — uniform Double in [0, 1). Cosmetic jitter only; the kernel
-    /// has no entropy source for SystemRandomNumberGenerator.
-    private func nextRandom() -> Double {
-        var x = rngState
-        x ^= x >> 12
-        x ^= x << 25
-        x ^= x >> 27
-        rngState = x
-        let v = x &* 0x2545_F491_4F6C_DD1D
-        return Double(v >> 11) / 9007199254740992 // 2^53
     }
 
     // MARK: - Formatting helpers

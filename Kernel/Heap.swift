@@ -18,11 +18,15 @@
 // straight back into the heap being reported on — so they are literal-only
 // UART writes plus the fixed counters below.
 //
-// Every public entry point (alloc/free/allocPages/freePages) is IRQ-atomic:
-// wrapped in armIrqSave/armIrqRestore (nesting-safe, unlike raw
-// enable/disable) so a timer IRQ can't context-switch into a second heap
-// user mid-operation — the preemptive scheduler makes the heap shared
-// between threads.
+// Every public entry point (alloc/free/allocPages/freePages) is atomic:
+// wrapped in Locks.lockIrqSave(Locks.heap)/Locks.unlockIrqRestore, which
+// pairs the arm_spin_lock cross-core spinlock with a nesting-safe DAIF
+// save/restore (unlike raw enable/disable). A timer IRQ can't context-switch
+// into a second heap user mid-operation on this core, and another core
+// can't enter the section at all — the preemptive SMP scheduler makes the
+// heap shared between threads on every core. The heap lock is the LOWEST
+// rung of the lock hierarchy (sched/tasks > klog > heap, see Locks.swift):
+// never klog() or allocate while holding it — diagnostics stay literal-only.
 //
 // Arena block format (16-byte aligned blocks, sizes are multiples of 16):
 //   +0        header: (magic << 32) | blockSize | flags (bit 0 = allocated)
@@ -209,8 +213,8 @@ enum KernelHeap {
     // MARK: - malloc
 
     static func alloc(size: Int, alignment: Int) -> UnsafeMutableRawPointer? {
-        let daif = armIrqSave()     // IRQ-atomic: see header comment
-        defer { armIrqRestore(daif) }
+        let daif = Locks.lockIrqSave(Locks.heap)     // cross-core atomic: see header comment
+        defer { Locks.unlockIrqRestore(Locks.heap, daif) }
         var align = alignment
         if align < 16 { align = 16 }
         if align > 1_048_576 { allocFailCount += 1; return nil } // absurd alignment: refuse (overflow guard)
@@ -289,8 +293,8 @@ enum KernelHeap {
     }
 
     static func free(_ p: UnsafeMutableRawPointer?) {
-        let daif = armIrqSave()     // IRQ-atomic: see header comment
-        defer { armIrqRestore(daif) }
+        let daif = Locks.lockIrqSave(Locks.heap)     // cross-core atomic: see header comment
+        defer { Locks.unlockIrqRestore(Locks.heap, daif) }
         guard let p else { return }
         let payload = UInt(bitPattern: p)
 
@@ -390,8 +394,8 @@ enum KernelHeap {
     // MARK: - Physical page allocator (4 KiB pages, first-fit contiguous)
 
     static func allocPages(_ count: Int) -> UInt? {
-        let daif = armIrqSave()     // IRQ-atomic: see header comment
-        defer { armIrqRestore(daif) }
+        let daif = Locks.lockIrqSave(Locks.heap)     // cross-core atomic: see header comment
+        defer { Locks.unlockIrqRestore(Locks.heap, daif) }
         guard count > 0, count <= pageCount - firstAllocPage else {
             allocFailCount += 1
             return nil
@@ -431,8 +435,8 @@ enum KernelHeap {
     }
 
     static func freePages(_ base: UInt, count: Int) {
-        let daif = armIrqSave()     // IRQ-atomic: see header comment
-        defer { armIrqRestore(daif) }
+        let daif = Locks.lockIrqSave(Locks.heap)     // cross-core atomic: see header comment
+        defer { Locks.unlockIrqRestore(Locks.heap, daif) }
         guard count > 0 else { return }
         // Validate the whole range before touching a single bit: a bad
         // freePages (out of region, unaligned, into the reserved arena/bitmap
@@ -466,8 +470,8 @@ enum KernelHeap {
     /// (allocFailCount keeps counting). Allocation-free by design — this runs
     /// precisely when the arena cannot serve another byte.
     static func noteOutOfMemory() {
-        let daif = armIrqSave()
-        defer { armIrqRestore(daif) }
+        let daif = Locks.lockIrqSave(Locks.heap)
+        defer { Locks.unlockIrqRestore(Locks.heap, daif) }
         guard !oomLogged else { return }
         oomLogged = true
         UART.write("[heap] OUT OF MEMORY (used=")
@@ -499,8 +503,8 @@ enum KernelHeap {
     /// inconsistency found (serial only — the heap may be the thing that is
     /// broken, so this never allocates). O(pages + arena blocks).
     static func validate() -> Bool {
-        let daif = armIrqSave()
-        defer { armIrqRestore(daif) }
+        let daif = Locks.lockIrqSave(Locks.heap)
+        defer { Locks.unlockIrqRestore(Locks.heap, daif) }
         guard initialized else {
             UART.write("[heap] validate: not initialized\n")
             return false

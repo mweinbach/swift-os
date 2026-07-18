@@ -28,8 +28,10 @@ SwiftOS kernel 1.0.0-aarch64 (Embedded Swift, bare metal)
 
 **Kernel**
 - Boot at EL2→EL1, FP/SIMD bring-up on all 4 cores, PL011 UART console
-- **SMP stage 1**: secondary CPUs online via PSCI CPU_ON (parked; the
-  scheduler/heap are still main-CPU only — see AGENTS.md)
+- **Real SMP**: all 4 cores schedule threads off a global run queue
+  (baton-locked context switch, per-core 100 Hz ticks and idles, cross-core
+  kill/reap, Linux-style %CPU — `smpdemo 3` shows ~300% across cores)
+- Panic broadcast: any core's panic halts the others via IPI
 - MMU + caches identity-mapping the full **8 GiB**, 1 GiB kernel heap
 - MMU + caches (identity map), page-bitmap physical allocator + boundary-tag
   heap backing the Swift runtime's `posix_memalign`/`free`
@@ -122,7 +124,8 @@ alignment faults, unicode shims, QEMU quirks).
 
 - Targets QEMU `virt` (Pi 5 profile: A76, 4 cores, 8 GiB); real-hardware
   bring-up is future work
-- SMP is stage 1: secondaries are parked; per-core scheduling is not here yet
+- Userland and drivers run on cpu0 by design; EL0 user processes and
+  cross-core TLB shootdown are future work
 - Apps share the compositor thread (kernel threads are preemptive; EL0 is a
   single synchronous demo run, not yet scheduled user processes)
 - Networking is IPv4+ICMP so far — no TCP/UDP yet

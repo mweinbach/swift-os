@@ -49,12 +49,15 @@ arm_switch_context:
     ret
 
 // Entry point woven into every fresh thread's initial frame (via the x30
-// slot). Exception entry masked IRQs, and a cooperative yield saves DAIF
-// with IRQs off too — so a brand-new thread always arrives here with IRQs
-// masked and must unmask them before doing any real work. (Threads resumed
-// through the IRQ path instead get their DAIF back from eret/SPSR.)
+// slot). A fresh thread's first switch-in inherits the sched-lock baton:
+// the core that picked it held Locks.sched across arm_switch_context, and
+// every other resume path releases it right after the switch returns — so
+// thread_start does the same via swift_thread_postswitch, which unlocks
+// Locks.sched and restores DAIF 0 (IRQs unmasked, as the old daifclr did).
+// (Threads resumed through the IRQ path instead get their DAIF back from
+// eret/SPSR.)
 thread_start:
-    msr     daifclr, #2
+    bl      swift_thread_postswitch       // release sched baton + unmask IRQs
     bl      swift_thread_bootstrap        // Never returns
 1:  wfi
     b       1b

@@ -10,23 +10,35 @@ Machine profile: **Raspberry Pi 5 match** — QEMU has no raspi5 machine model
 (and raspi3b/raspi4b use an incompatible BCM peripheral map), so we run
 `-M virt -cpu cortex-a76 -smp 4 -m 8192`: same Cortex-A76 cores, core count,
 and 8 GiB RAM. The MMU identity-maps 8 GiB (L1[1..8] -> per-GiB L2 tables);
-the kernel heap is 1 GiB at 0x40800000-0x80800000. SMP stage 1: secondaries
-come online via PSCI CPU_ON (per-core FP/SIMD enable), print one
-spinlock-guarded line, and park in wfi — scheduler/heap/drivers are still
-main-CPU only (IRQ-mask guards do NOT protect across cores; per-core run
-queues + real locks are the next round).
+the kernel heap is 1 GiB at 0x40800000-0x80800000. SMP: secondaries come
+online via PSCI CPU_ON (per-core FP/SIMD enable), REPLAY the BSP's captured
+MMU sysregs (PSCI starts them MMU-off — memory is device-like and unaligned
+accesses fault), run Interrupts.initCoreInterrupts (banked GIC CPU interface
++ SGI/PPI enables, vectors, local 100 Hz tick), and enter
+Scheduler.runCore(cpu:) — per-core scheduling is live. Real spinlocks +
+lock hierarchy in Kernel/Locks.swift (sched/tasks > klog > heap). SGI 1 is
+the panic-halt IPI: the panic path broadcasts it first thing (target-list
+mode via GICD_SGIR), other cores park silently in wfi, and the dump takes
+NO locks at all.
 
 ## Layout
 
 - `Kernel/` — the kernel: `Boot.S` (entry, EL2→EL1 drop, BSS, FP/SIMD enable,
   asm helpers), `Main.swift` (kmain + compositor loop), `UART.swift` (PL011 +
   klog/kprint + BootLog), `MMIO.swift` (volatile accessors), `Interrupts.swift`
-  + `Vectors.S` (GICv2 + 100 Hz timer; the fatal sync/FIQ/SError vector stubs
-  snapshot all GPRs and call `swift_fatal_exception`), `Panic.swift` (crash
-  dump: full register/ESR/FAR dump + frame-pointer backtrace on serial, then
+  + `Vectors.S` (GICv2 + 100 Hz per-core timer ticks; `initCoreInterrupts(cpu:)`
+  is the per-core GICC/banked-PPI/vectors/tick bring-up every core runs; SGI 1
+  is the panic-halt IPI, parked inline by irq_entry; the fatal sync/FIQ/SError
+  vector stubs snapshot all GPRs and call `swift_fatal_exception`), `Panic.swift`
+  (crash dump: first broadcasts SGI 1 to park all other cores, then full
+  register/ESR/FAR dump + frame-pointer backtrace on serial, then
   the same text rendered onto the front framebuffer — zero allocation,
-  StaticString-only, recursive-fault guard; serial-only when `Display.width`
-  is 0), `Heap.swift` (page bitmap + boundary-tag
+  StaticString-only, NO locks of any kind, recursive-fault guard;
+  serial-only when `Display.width`
+  is 0), `SMP.swift` + `SMP.S` (PSCI CPU_ON bring-up, the per-core MMU join
+  that replays the BSP's captured translation sysregs, `arm_read_mpidr`, the
+  klog spinlock), `Locks.swift` (cross-core spinlock hierarchy:
+  sched/tasks > klog > heap), `Heap.swift` (page bitmap + boundary-tag
   malloc backing `posix_memalign`/`free`; header/footer words carry a 32-bit
   magic — 0xA110CA7E allocated / 0xFEE1DEAD freed — bad frees are logged on
   the UART and ignored, never panicking or corrupting; `validate()` is an

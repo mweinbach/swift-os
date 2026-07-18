@@ -442,6 +442,7 @@ final class Shell {
         case "man": return cmdMan(args)
         case "neofetch": return cmdNeofetch()
         case "kill": return cmdKill(args)
+        case "smpdemo": return cmdSMPDemo(args)
         case "nano": return cmdNano(args)
         case "top": return cmdTop(args)
         case "ping": return cmdPing(args)
@@ -880,7 +881,7 @@ final class Shell {
             "Shell: \(services.shellName)",
             "WM: \(services.wmName)",
             "Terminal: \(services.terminalName)",
-            "CPU: Apple Silicon",
+            "CPU: Apple Silicon (\(Config.cpuCount) cores)",
             "Memory: \(Int(services.usedMemoryMB))MiB / \(Int(services.totalMemoryMB))MiB",
         ]
         let logo = Shell.neofetchLogo
@@ -909,8 +910,9 @@ final class Shell {
         return "Opening \(full)"
     }
 
-    /// `kill <pid>` — closes the window whose process owns that PID (window
-    /// processes are the only user-space processes that really exist here).
+    /// `kill <pid>` — closes the window whose process owns that PID, or stops
+    /// a kernel thread listed in ps (e.g. an smpdemo spin<N> task) via the
+    /// scheduler. Everything else is not permitted.
     private func cmdKill(_ args: [String]) -> String {
         guard let arg = args.first, let pid = Int(arg) else {
             return sgrError("usage: kill <pid>")
@@ -919,7 +921,37 @@ final class Shell {
             WindowManager.shared.close(window)
             return "killed \(pid)"
         }
+        // Not a window: a ps-listed kernel thread goes to the scheduler.
+        // Gate on the demo-thread naming (spin<N>) so the call can only
+        // ever touch smpdemo threads, never system threads (main, idle,
+        // kworker, swiftcomp, inputd) — those and unknown pids are EPERM.
+        // NOTE: Scheduler.kill is pinned as taking the ps-shown id; the
+        // landed implementation indexes thread SLOTS, so until the
+        // scheduler resolves Tasks-registry ids this may report EPERM for
+        // live spinners (see integration note — confined to demo threads).
+        if let task = Platform.services.processes.first(where: { $0.pid == pid }),
+           task.name.hasPrefix("spin"),
+           Scheduler.kill(id: pid) {
+            return "killed \(pid)"
+        }
         return sgrError("kill: \(pid): Operation not permitted")
+    }
+
+    /// `smpdemo [n]` — spawn n CPU-bound demo threads (default 3, capped at
+    /// 8) so per-core scheduling/accounting is visible in ps, top and the
+    /// System Monitor. The threads run until `kill <pid>`.
+    private func cmdSMPDemo(_ args: [String]) -> String {
+        var count = 3
+        if let arg = args.first {
+            guard let n = Int(arg) else { return sgrError("usage: smpdemo [n]") }
+            count = min(8, max(1, n))
+        }
+        var out = "spawning \(count) compute threads (kill <pid> to stop, ps/top to watch)"
+        let spawned = Scheduler.demoSpinners(count: count)
+        if spawned < count {
+            out += "\nsmpdemo: only \(spawned) thread(s) started (thread table limit)"
+        }
+        return out
     }
 
     /// `nano <file>` — the Text Editor stands in for nano; like the real nano
@@ -1240,7 +1272,8 @@ final class Shell {
           hostname               print the system hostname
           ping [-c N] <ip>       ping a dotted-quad IPv4 host
           ps [aux]               print the process table
-          kill <pid>             close the app window owning a process
+          kill <pid>             close an app window or stop a kernel thread
+          smpdemo [n]            spawn n CPU-bound demo threads (default 3, max 8)
           top                    open the System Monitor (process viewer)
           uptime                 uptime and load average
           date                   current date and time
@@ -1365,8 +1398,16 @@ final class Shell {
         "kill": """
         kill(1) - terminate a process
         usage: kill <pid>
-        Closes the window that owns the process (see `ps` for PIDs). Only
-        window-backed processes can be killed; anything else is not permitted.
+        Closes the window that owns the process (see `ps` for PIDs), or stops
+        a kernel thread such as an smpdemo spin<N> task. Protected threads
+        (main, idle) and unknown pids are not permitted.
+        """,
+        "smpdemo": """
+        smpdemo(1) - spawn CPU-bound demo threads
+        usage: smpdemo [n]
+        Starts n compute threads (default 3, at most 8) named spin<N>
+        to show SMP scheduling: watch them in `ps`, `top` or the System
+        Monitor (three spinners total ~300% CPU), then `kill <pid>` to stop.
         """,
         "nano": """
         nano(1) - edit a file

@@ -16,6 +16,12 @@
 //   - ZERO allocation, ZERO Swift containers, no String building, no
 //     retain/release. Output is PL011 MMIO writes + plain pointer stores
 //     only; text is StaticString literals and a table-free hex formatter.
+//   - NO LOCKS, ever — not even the klog spinlock: the panic may have
+//     struck while another core holds a lock mid-critical-section, and
+//     spinning on it would hang the dump forever. Instead, the FIRST thing
+//     every panic path does is broadcast the panic-halt IPI (SGI 1) so all
+//     other cores park silently (see Vectors.S panic_halt_ipi); the dump
+//     then proceeds on the panicking core only, uncontended.
 //   - SERIAL FIRST, SCREEN SECOND: the whole dump is emitted once with the
 //     screen gated off (serial cannot fail — it is pure MMIO), then emitted
 //     again onto the front framebuffer. If the screen pass itself dies
@@ -33,6 +39,7 @@
 // ============================================================================
 
 @_silgen_name("arm_mask_all") private func armMaskAll()
+@_silgen_name("arm_read_mpidr") private func armReadMpidr() -> UInt
 
 enum Panic {
     /// Bounds for validating frame-pointer chain links before dereferencing:
@@ -57,6 +64,12 @@ enum Panic {
     /// Non-zero once any panic path has been entered (recursive-fault guard).
     private static var entered: UInt8 = 0
 
+    /// GICD_SGIR (QEMU virt GICv2): software-generated interrupt register.
+    private static let gicdSgir: UInt = 0x0800_0F00
+    /// Panic-halt IPI: SGI 1. Must match Interrupts.panicHaltIntid and the
+    /// SGI check in Vectors.S' irq_entry.
+    private static let panicHaltSgiId: UInt32 = 1
+
     /// Font glyph base, bound on the first screen pass. FontData.bitmap is a
     /// static let whose storage lives for the life of the kernel, so holding
     /// its base pointer past withUnsafeBufferPointer's scope is sound here.
@@ -76,6 +89,7 @@ enum Panic {
     /// Fatal exception dump + halt. Never returns.
     static func fatal(kind: UInt64, esr: UInt64, elr: UInt64, far: UInt64,
                       spsr: UInt64, regs: UnsafePointer<UInt64>) -> Never {
+        broadcastPanicHalt()
         armMaskAll()
         if entered != 0 {
             serialOn = true
@@ -111,6 +125,7 @@ enum Panic {
     /// `reason` must be a literal or otherwise pre-built string — building a
     /// string INSIDE the panic path would allocate.
     static func halt(_ reason: String) -> Never {
+        broadcastPanicHalt()
         armMaskAll()
         if entered != 0 {
             serialOn = true
@@ -133,6 +148,30 @@ enum Panic {
             screenOn = false
         }
         hardHalt()
+    }
+
+    // MARK: - Panic-halt broadcast (SGI 1)
+
+    /// Park every OTHER core before the dump starts: raise SGI 1
+    /// ("panic-halt") at all CPUs except this one, in GICD_SGIR target-list
+    /// mode (TargetListFilter = 0b00, CPUTargetList = one bit per cpu in
+    /// bits 23:16, SGIINTID in bits 3:0). The receiving cores take the
+    /// panic_halt_ipi path in Vectors.S and park in wfi silently, so the
+    /// serial/screen dump below is emitted by this core alone.
+    ///
+    /// Pure MMIO + one system-register read: NO allocation, NO locks — safe
+    /// from any kernel state (a pre-GIC panic is harmless too: the SGIR
+    /// write is accepted and simply delivers nothing while the distributor
+    /// is disabled, and secondaries are not started before initInterrupts).
+    private static func broadcastPanicHalt() {
+        let myCpu = UInt32(armReadMpidr() & 0xFF)       // MPIDR Aff0 = cpu index
+        var targets: UInt32 = 0
+        var cpu: UInt32 = 0
+        while cpu < UInt32(Config.cpuCount) {
+            if cpu != myCpu { targets |= UInt32(1) << cpu }
+            cpu += 1
+        }
+        mmioWrite32(gicdSgir, (targets << 16) | panicHaltSgiId)
     }
 
     // MARK: - Dump composition

@@ -212,6 +212,8 @@ irq_entry:
     and     w10, w0, #0x3FF                 // INTID
     cmp     w10, #1023
     b.eq    1f                              // spurious: no EOIR, just return
+    cmp     w10, #1
+    b.eq    panic_halt_ipi                  // SGI 1: another core panicked
     bl      swift_irq_dispatch              // x0 = IAR: tick, reprogram, EOIR
 1:
     ldp     q0,  q1,  [sp, #176]
@@ -234,6 +236,17 @@ irq_entry:
     ldr     x30, [sp, #152]
     add     sp, sp, #304
     eret
+
+// Panic-halt IPI (SGI 1, broadcast by Kernel/Panic.swift): another core is
+// panicking and owns the UART + screen from here on. Park THIS core
+// immediately and SILENTLY: mask the whole DAIF set and wfi forever. Prints
+// NOTHING (the serial line belongs to the panicking core's dump), takes no
+// locks, and writes no EOIR — the abandoned IRQ frame and the un-EOI'd SGI
+// are irrelevant once the core is parked for good.
+panic_halt_ipi:
+    msr     daifset, #0xF
+1:  wfi
+    b       1b
 
 // FIQ: none are configured (the GIC is run in IRQ-only mode), so taking one
 // is fatal. FIQ entry sets no ESR/FAR — pass zeroes; ELR/SPSR are real.
